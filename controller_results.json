@@ -1,0 +1,13 @@
+﻿{
+    "python_ok":  true,
+    "ready":  true,
+    "os_version":  "10.0.26200",
+    "build":  "26200",
+    "powershell_version":  5,
+    "errors":  [
+
+               ],
+    "os_name":  "Microsoft Windows 11 Home",
+    "bitness":  "64-bit",
+    "deps_ok":  true
+}
