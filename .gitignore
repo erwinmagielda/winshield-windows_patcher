@@ -8,6 +8,7 @@ __pycache__/
 # Each person will have different results based on their system
 # No need to commit my personal scan results
 scan_results.json
+controller_results.json
 
 # Log files - useful for debugging but not part of the actual code
 # These get messy and change constantly, don't belong in version control

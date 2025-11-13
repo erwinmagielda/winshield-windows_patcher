@@ -1,0 +1,15 @@
+{
+  "scan_date": "2025-11-13T19:58:51.264800",
+  "os_name": "Microsoft Windows 11 Home",
+  "build": "26200",
+  "bitness": "64-bit",
+  "total_cves": 0,
+  "missing_cves_count": 0,
+  "missing_cves": [],
+  "installed_kbs_sample": [
+    "5054156",
+    "5067035",
+    "5067931",
+    "5068861"
+  ]
+}
