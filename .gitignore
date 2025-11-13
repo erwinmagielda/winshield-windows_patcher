@@ -7,7 +7,7 @@ __pycache__/
 # Scanner output file - gets regenerated every time I run the scanner
 # Each person will have different results based on their system
 # No need to commit my personal scan results
-scan_results.json
+scanner_results.json
 controller_results.json
 
 # Log files - useful for debugging but not part of the actual code
@@ -32,3 +32,4 @@ desktop.ini
 notes.txt
 scanner3.py
 scanner.py
+WinShield_Scanner_Debug.py
