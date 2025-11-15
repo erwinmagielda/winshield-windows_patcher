@@ -1,498 +1,348 @@
 """
-WinShield - Windows KB-based Vulnerability Scanner (Catalog Edition)
+WinShield - Windows Vulnerability Scanner (KB→CVE Edition)
 
-New approach:
-    - Use Microsoft Update Catalog as the source of truth for available KBs
-    - Enumerate installed KBs locally (Get-HotFix, etc.)
-    - Search the Catalog for updates that match this OS + bitness
-    - Any catalog KB missing locally is treated as a missing patch
-
-This version does NOT rely on MSRC CVRF -> KB mappings
-(because modern CVRF bulletins often contain no KB-based Vendor Fix entries).
+Pipeline:
+  1) Read controller_results.json (OS name, build, bitness)
+  2) Get installed KBs via PowerShell Get-HotFix
+  3) Query Microsoft Update Catalog for this OS/bitness → list of KBs
+  4) For each KB, fetch support.microsoft.com/help/<KB> and extract CVE IDs
+  5) Compare installed vs catalog KBs
+  6) Show table: ID | KB | Status | CVEs (fixed by this KB)
+  7) Save scanner_results.json + kb_metadata.json
 """
 
-# ----------------------------
-# Standard library imports
-# ----------------------------
 import json
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime
-from typing import Optional, Set, List, Dict, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-import platform  # OS information for context
-
-# ----------------------------
-# Third-party imports
-# ----------------------------
 import requests
 from rich.console import Console
 from rich.table import Table
 
-# ============================================================
-# Configuration
-# ============================================================
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
 
-POWERSHELL_TIMEOUT_SHORT = 30
-POWERSHELL_TIMEOUT_LONG = 90
-SYSTEMINFO_TIMEOUT = 60
+POWERSHELL_TIMEOUT = 60
+HTTP_TIMEOUT = 20
 
-# Log file name for tee logging
-LOG_FILE_NAME = f"winshield_catalog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+CONTROLLER_JSON = "controller_results.json"
+SCANNER_RESULTS_JSON = "scanner_results.json"
+KB_METADATA_JSON = "kb_metadata.json"
 
-# Microsoft Update Catalog base URL
-CATALOG_SEARCH_URL = "https://www.catalog.update.microsoft.com/Search.aspx"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
 
-# ============================================================
-# Logging tee
-# ============================================================
+console = Console()
 
 
-class TeeStream:
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
+
+def load_controller_env(path: str = CONTROLLER_JSON) -> Dict:
     """
-    Simple tee for stdout and stderr.
-    Whatever is printed goes both to console and to the log file.
+    Load controller_results.json written by WinShield_Controller.
+    Accepts UTF-8 with or without BOM.
     """
-
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data: str) -> None:
-        for s in self.streams:
-            s.write(data)
-
-    def flush(self) -> None:
-        for s in self.streams:
-            s.flush()
-
-
-# Set up logging early so everything is captured
-_log_file_handle = open(LOG_FILE_NAME, "w", encoding="utf-8")
-sys.stdout = TeeStream(sys.__stdout__, _log_file_handle)
-sys.stderr = TeeStream(sys.__stderr__, _log_file_handle)
-
-# Use real stdout for color support, force terminal mode so colors always show
-console = Console(file=sys.__stdout__, force_terminal=True)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return data
+    except Exception as exc:
+        console.print(
+            f"[bold red]ERROR:[/bold red] Could not load {path} ({exc}). "
+            "Run WinShield_Controller first."
+        )
+        sys.exit(1)
 
 
-# ============================================================
-# Helper utilities
-# ============================================================
+def normalize_ps_json(pipe_text: Optional[str]) -> str:
+    if not pipe_text:
+        return ""
+    return pipe_text.replace("\x00", "").lstrip("\ufeff").strip()
 
-def run_powershell(ps_command: str, timeout_seconds: int = POWERSHELL_TIMEOUT_SHORT) -> Tuple[int, str, str]:
-    """
-    Run a PowerShell command in a safe way.
 
-    Returns:
-        (exit_code, stdout, stderr)
-    """
+def run_powershell(ps_command: str, timeout: int = POWERSHELL_TIMEOUT) -> Tuple[int, str, str]:
     try:
         proc = subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
             capture_output=True,
             text=True,
-            timeout=timeout_seconds
+            timeout=timeout,
         )
         return proc.returncode, proc.stdout, proc.stderr
     except Exception as exc:
         return 1, "", f"Exception: {exc!r}"
 
 
-def extract_kb_number(text: str) -> Optional[str]:
-    """
-    Pull numeric KB identifier out of text.
-
-    Examples:
-        'KB5048667'              -> '5048667'
-        'Install KB5048667 now'  -> '5048667'
-    """
-    if not text:
-        return None
-    match = re.search(r"KB(\d{6,8})", text, re.IGNORECASE)
-    return match.group(1) if match else None
-
-
-def get_windows_os_bitness() -> str:
-    """
-    Returns '32-bit' or '64-bit' for the actual Windows OS
-    (not just Python interpreter architecture).
-    """
-    # --- Primary: WMIC ---
-    try:
-        proc = subprocess.run(
-            ["wmic", "os", "get", "osarchitecture"],
-            capture_output=True,
-            text=True,
-            timeout=POWERSHELL_TIMEOUT_SHORT
-        )
-        output = proc.stdout.strip().splitlines()
-        if len(output) >= 2:
-            arch_line = output[1].strip()
-            if "64" in arch_line:
-                return "64-bit"
-            if "32" in arch_line:
-                return "32-bit"
-    except Exception:
-        pass
-
-    # Fallback: environment-based detection
-    arch = os.environ.get("PROCESSOR_ARCHITECTURE", "").upper()
-    arch_wow = os.environ.get("PROCESSOR_ARCHITEW6432", "").upper()
-
-    if arch == "X86" and arch_wow:
-        return "64-bit"
-    if arch in ("AMD64", "ARM64"):
-        return "64-bit"
-    return "32-bit"
-
-
-def load_controller_environment() -> Dict:
-    """
-    Try to load controller_results.json written by WinShield_Controller.
-
-    Returns:
-        dict with keys like os_name, os_version, build, bitness, etc.
-        If file is missing or broken, returns {} and we fall back to platform().
-    """
-    controller_path = os.path.join(os.path.dirname(__file__), "controller_results.json")
-    if not os.path.exists(controller_path):
-        console.print("[yellow]No controller_results.json found - falling back to local OS detection.[/yellow]")
-        return {}
-
-    try:
-        with open(controller_path, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-        console.print(f"[dim][DEBUG] Loaded controller env: {data}[/dim]")
-        return data
-    except Exception as exc:
-        console.print(f"[red]Failed to load controller_results.json: {exc}[/red]")
-        return {}
-
-
-# ============================================================
-# Stage 1 - Installed KB discovery
-# ============================================================
-
 def get_installed_kbs() -> Tuple[Set[str], str]:
     """
-    Enumerate installed KBs as numeric strings without the 'KB' prefix.
-
-    Try several mechanisms:
-        1) PowerShell Get-HotFix
-        2) WMIC QFE
-        3) systeminfo
-
-    First one that returns any KBs wins.
-
-    Returns:
-        (set_of_kb_numbers, source_name)
+    Enumerate installed KBs (numeric IDs, no 'KB' prefix).
+    Uses Get-HotFix and falls back to WMIC if needed.
     """
     console.print("[*] Enumerating installed patches...")
 
-    # --- Attempt 1: Get-HotFix ---
-    ps_get_hotfix = r"""
+    # --- Attempt 1: Get-HotFix via PowerShell ---
+    ps_script = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$items = Get-HotFix | Select-Object HotFixID, InstalledOn
-$items | ConvertTo-Json -Depth 3
+$items = Get-HotFix | Select-Object HotFixID
+$items | ConvertTo-Json -Depth 2
 """
-    exit_code, stdout_text, stderr_text = run_powershell(ps_get_hotfix)
-
-    if exit_code == 0 and stdout_text.strip():
-        # Clean weird UTF-16 noise if any
-        raw_json = stdout_text.replace("\x00", "").lstrip("\ufeff").strip()
-        try:
-            parsed = json.loads(raw_json)
-            if isinstance(parsed, dict):
-                parsed = [parsed]
-            kb_numbers: Set[str] = set()
-            for item in parsed:
-                kb_numeric = extract_kb_number(str(item.get("HotFixID", "")))
-                if kb_numeric:
-                    kb_numbers.add(kb_numeric)
-            if kb_numbers:
-                console.print(f"[+] Found {len(kb_numbers)} KBs via Get-HotFix")
-                return kb_numbers, "Get-HotFix"
-            else:
-                console.print("[!] Get-HotFix returned JSON but no KB entries")
-        except json.JSONDecodeError:
-            console.print("[!] Get-HotFix did not return valid JSON")
+    rc, out_text, err_text = run_powershell(ps_script)
+    if rc == 0:
+        raw = normalize_ps_json(out_text)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                kbs: Set[str] = set()
+                for item in parsed:
+                    hotfix_id = str(item.get("HotFixID", "")).upper()
+                    m = re.search(r"KB(\d+)", hotfix_id)
+                    if m:
+                        kbs.add(m.group(1))
+                if kbs:
+                    console.print(f"[+] Found {len(kbs)} KBs via Get-HotFix")
+                    return kbs, "Get-HotFix"
+            except json.JSONDecodeError:
+                console.print("[!] Get-HotFix JSON parse failed; falling back")
+        else:
+            console.print("[!] Get-HotFix returned empty output; falling back")
     else:
-        if stderr_text.strip():
-            console.print(f"[!] PowerShell Get-HotFix error: {stderr_text.strip()}")
+        console.print(f"[!] Get-HotFix error: {err_text.strip() or 'unknown'}")
 
     # --- Attempt 2: WMIC QFE ---
     try:
-        wmic_proc = subprocess.run(
-            ["wmic", "qfe", "get", "HotFixID,InstalledOn", "/format:csv"],
+        proc = subprocess.run(
+            ["wmic", "qfe", "get", "HotFixID", "/format:csv"],
             capture_output=True,
             text=True,
-            timeout=POWERSHELL_TIMEOUT_SHORT
+            timeout=POWERSHELL_TIMEOUT,
         )
-        if wmic_proc.returncode == 0 and wmic_proc.stdout:
-            kb_numbers: Set[str] = set()
-            for line in wmic_proc.stdout.splitlines():
+        if proc.returncode == 0 and proc.stdout:
+            kbs: Set[str] = set()
+            for line in proc.stdout.splitlines():
                 line = line.strip()
                 if not line or line.startswith("Node"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 3 and parts[1].upper().startswith("KB"):
-                    kb_numeric = extract_kb_number(parts[1])
-                    if kb_numeric:
-                        kb_numbers.add(kb_numeric)
-            if kb_numbers:
-                console.print(f"[+] Found {len(kb_numbers)} KBs via WMIC QFE")
-                return kb_numbers, "WMIC QFE"
-            else:
-                console.print("[!] WMIC returned no KB entries")
-        else:
-            if wmic_proc.stderr.strip():
-                console.print(f"[!] WMIC error: {wmic_proc.stderr.strip()}")
+                if len(parts) >= 2 and parts[1].upper().startswith("KB"):
+                    m = re.search(r"KB(\d+)", parts[1], re.IGNORECASE)
+                    if m:
+                        kbs.add(m.group(1))
+            if kbs:
+                console.print(f"[+] Found {len(kbs)} KBs via WMIC")
+                return kbs, "WMIC QFE"
     except Exception as exc:
         console.print(f"[!] WMIC attempt failed: {exc!r}")
 
-    # --- Attempt 3: systeminfo ---
-    try:
-        sysinfo_proc = subprocess.run(
-            ["systeminfo"],
-            capture_output=True,
-            text=True,
-            timeout=SYSTEMINFO_TIMEOUT
-        )
-        combined = (sysinfo_proc.stdout or "") + (sysinfo_proc.stderr or "")
-        if combined:
-            kb_numbers: Set[str] = set()
-            for line in combined.splitlines():
-                match = re.search(r"KB(\d{6,8})", line, re.IGNORECASE)
-                if match:
-                    kb_numbers.add(match.group(1))
-            if kb_numbers:
-                console.print(f"[+] Found {len(kb_numbers)} KBs via systeminfo")
-                return kb_numbers, "systeminfo"
-            else:
-                console.print("[!] systeminfo listed no KBs")
-    except Exception as exc:
-        console.print(f"[!] systeminfo attempt failed: {exc!r}")
-
-    console.print("[!] Could not enumerate installed KBs on this system")
+    console.print("[!] Could not enumerate installed KBs – treating system as unpatched.")
     return set(), "None"
 
 
-# ============================================================
-# Stage 2 - Microsoft Update Catalog discovery
-# ============================================================
-
-def build_catalog_query(os_name: str, bitness: str) -> str:
+def discover_catalog_kbs(os_name: str, bitness: str) -> List[str]:
     """
-    Build a reasonable search string for Microsoft Update Catalog.
-
-    Examples:
-        'Windows 11' + '64-bit' -> 'Windows 11 for x64-based Systems'
-        'Windows 10' + '32-bit' -> 'Windows 10 for x86-based Systems'
+    Hit Microsoft Update Catalog search and scrape KB numbers.
+    We keep this intentionally simple: search for
+       '<os_name> for x64-based Systems'
+    or
+       '<os_name> for x86-based Systems'
+    then regex KB\d+ from the HTML.
     """
-    os_name_simple = os_name.replace("Microsoft ", "").strip()
+    arch_str = "x64-based Systems" if "64" in bitness else "x86-based Systems"
+    query = f"{os_name} for {arch_str}"
 
-    if "11" in os_name_simple:
-        if "64" in bitness:
-            return f"{os_name_simple} for x64-based Systems"
-        else:
-            return f"{os_name_simple} for x86-based Systems"
+    console.print(
+        "[*] Querying Microsoft Update Catalog for: "
+        f"[bold green]'{query}'[/bold green]"
+    )
 
-    if "10" in os_name_simple:
-        if "64" in bitness:
-            return f"{os_name_simple} for x64-based Systems"
-        else:
-            return f"{os_name_simple} for x86-based Systems"
-
-    # Fallback generic
-    return os_name_simple
-
-
-def discover_kbs_from_catalog(os_name: str, bitness: str, max_kbs: int = 500) -> Set[str]:
-    """
-    Query Microsoft Update Catalog and extract KB numbers from the HTML.
-
-    This is a best-effort, HTML-scraping based approach:
-        - We hit Search.aspx?q=<query>
-        - We grep for 'KB1234567' style patterns in the returned HTML
-        - We keep KBs whose surrounding text looks like it belongs to this OS/bitness
-
-    Returns:
-        Set of KB numeric strings.
-    """
-    search_query = build_catalog_query(os_name, bitness)
-    console.print(f"[*] Querying Microsoft Update Catalog for: '{search_query}'")
+    search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
+    params = {"q": query}
+    headers = {"User-Agent": USER_AGENT}
 
     try:
-        response = requests.get(
-            CATALOG_SEARCH_URL,
-            params={"q": search_query},
-            timeout=POWERSHELL_TIMEOUT_LONG,
-        )
+        resp = requests.get(search_url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
     except Exception as exc:
-        console.print(f"[red]Error contacting Update Catalog: {exc!r}[/red]")
-        return set()
+        console.print(f"[bold red]ERROR:[/bold red] Failed to query Update Catalog: {exc!r}")
+        return []
 
-    if response.status_code != 200:
-        console.print(f"[red]Update Catalog returned HTTP {response.status_code}[/red]")
-        return set()
+    html = resp.text
+    kb_matches = re.findall(r"KB(\d{6,})", html, re.IGNORECASE)
+    unique_kbs = sorted(set(kb_matches), key=int)
 
-    html = response.text
-    # Rough cut: find all KB-like tokens
-    kb_matches = re.findall(r"KB(\d{6,8})", html, re.IGNORECASE)
-    kb_set: Set[str] = set(kb_matches)
-
-    # Optional: filter by lines mentioning our OS name / architecture
-    filtered_kbs: Set[str] = set()
-    if kb_set:
-        os_name_lower = os_name.lower()
-        bitness_token = "x64" if "64" in bitness else "x86"
-
-        # For each KB, find context snippet and see if OS/arch words appear nearby
-        for kb in kb_set:
-            pattern = re.compile(rf".{{0,80}}KB{kb}.{{0,80}}", re.IGNORECASE | re.DOTALL)
-            for match in pattern.finditer(html):
-                snippet = match.group(0).lower()
-                if os_name_lower.split()[-1] in snippet or "windows" in snippet:
-                    if bitness_token in snippet or "for arm64" in snippet or "for x64" in snippet or "for x86" in snippet:
-                        filtered_kbs.add(kb)
-                        break
-
-    chosen = filtered_kbs if filtered_kbs else kb_set
-    if chosen:
-        # Trim to max_kbs to avoid huge sets on very old / very broad queries
-        trimmed = set(list(chosen)[:max_kbs])
-        console.print(f"[+] Discovered {len(trimmed)} catalog KBs for this OS/bitness (before diff)")
-        return trimmed
-
-    console.print("[!] No KBs discovered from Update Catalog search")
-    return set()
+    console.print(
+        f"[+] Discovered {len(unique_kbs)} catalog KBs for this OS/bitness (before diff)"
+    )
+    return unique_kbs
 
 
-# ============================================================
-# Stage 3 - Compare installed vs catalog
-# ============================================================
-
-def find_missing_kbs(installed_kbs: Set[str], catalog_kbs: Set[str]) -> Set[str]:
+def fetch_kb_cves(kb_id: str) -> List[str]:
     """
-    Any KB that exists in the catalog set but not in installed set is treated as missing.
+    Try to discover CVEs fixed by a given KB using support.microsoft.com/help/<KB>.
+    We simply look for CVE-YYYY-NNNN patterns in the page content.
     """
-    if not catalog_kbs:
-        return set()
-    if not installed_kbs:
-        # System appears to have no patches; treat all catalog KBs as missing
-        return set(catalog_kbs)
-    return catalog_kbs - installed_kbs
+    urls = [
+        f"https://support.microsoft.com/help/{kb_id}",
+        f"https://support.microsoft.com/en-us/help/{kb_id}",
+    ]
+    headers = {"User-Agent": USER_AGENT}
+    cves: Set[str] = set()
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+
+        # Extract CVE IDs
+        matches = re.findall(r"CVE-\d{4}-\d{4,7}", resp.text, re.IGNORECASE)
+        for m in matches:
+            cves.add(m.upper())
+
+        # If we found some, no need to try more URLs
+        if cves:
+            break
+
+    return sorted(cves)
 
 
-# ============================================================
-# Output / reporting
-# ============================================================
+# -------------------------------------------------------------------
+# Display
+# -------------------------------------------------------------------
 
-def display_missing_kbs(missing_kbs: Set[str], installed_kbs: Set[str], os_name: str, os_bitness: str) -> None:
-    """
-    Show missing KBs in a Rich table.
-    """
-    if not missing_kbs:
-        console.print("[bold green]No missing catalog KBs detected for this OS query.[/bold green]")
-        console.print("[dim](Note: this does NOT mean the system is fully patched, only that our\
- catalog query did not find additional KBs to compare.)[/dim]")
+def display_kb_table(kb_details: List[Dict]) -> None:
+    if not kb_details:
+        console.print("[bold yellow]No catalog KBs to display.[/bold yellow]")
         return
-
-    console.print(f"\n[bold red]Found {len(missing_kbs)} catalog KBs not installed on this system[/bold red]")
-    console.print(f"[dim]OS: {os_name} ({os_bitness}), Installed KBs: {len(installed_kbs)}[/dim]\n")
 
     table = Table(
         title="Missing KBs (from Microsoft Update Catalog query)",
         show_header=True,
-        header_style="bold magenta"
+        header_style="bold magenta",
     )
-    table.add_column("KB", style="cyan", width=12)
-    table.add_column("Status", style="yellow", width=20)
-    table.add_column("Notes", style="white", width=60)
+    table.add_column("ID", style="dim", width=4)
+    table.add_column("KB")
+    table.add_column("Status", width=10)
+    table.add_column("CVEs Fixed")
 
-    for kb in sorted(missing_kbs):
-        table.add_row(
-            f"KB{kb}",
-            "[red]Missing[/red]",
-            "Listed in Update Catalog for this OS/bitness but not installed"
-        )
+    for idx, kb_info in enumerate(kb_details, start=1):
+        kb_str = f"KB{kb_info['kb']}"
+        status = kb_info["status"]
+        cves = kb_info.get("cves") or []
+
+        status_style = "bold red" if status == "Missing" else "bold green"
+        status_text = f"[{status_style}]{status}[/{status_style}]"
+
+        if cves:
+            # Join CVEs but avoid an absurdly long column
+            cve_text = ", ".join(cves)
+            if len(cve_text) > 80:
+                cve_text = cve_text[:77] + "..."
+        else:
+            cve_text = "N/A"
+
+        table.add_row(str(idx), kb_str, status_text, cve_text)
 
     console.print(table)
 
 
-# ============================================================
-# Main orchestration
-# ============================================================
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
 
 def main() -> None:
-    console.print("[bold cyan]WinShield - Windows Vulnerability Scanner (Catalog Edition)[/bold cyan]\n")
+    console.print("[bold cyan]WinShield - Windows Vulnerability Scanner[/bold cyan]\n")
 
-    # Prefer controller's OS info if available
-    controller_env = load_controller_environment()
-    if controller_env:
-        os_name = controller_env.get("os_name") or controller_env.get("caption") or platform.system()
-        os_version = controller_env.get("os_version") or controller_env.get("version") or ""
-        build = controller_env.get("build") or ""
-        bitness = controller_env.get("bitness") or get_windows_os_bitness()
-    else:
-        # Fallback: use local detection
-        os_name = f"{platform.system()} {platform.release()}"
-        os_version = platform.version()
-        build = ""
-        bitness = get_windows_os_bitness()
+    # 1) Load environment from controller
+    env = load_controller_env()
+    os_name = env.get("os_name", "Unknown Windows")
+    build = env.get("build", "Unknown")
+    bitness = env.get("bitness", "Unknown")
 
-    console.print(f"[dim]OS detected: {os_name} (version {os_version}{', build ' + build if build else ''}, {bitness})[/dim]\n")
+    console.print(
+        f"OS detected: [bold]{os_name}[/bold] "
+        f"(build {build}, {bitness})\n"
+    )
 
-    # Stage 1: installed KBs
+    # 2) Installed KBs
     installed_kbs, kb_source = get_installed_kbs()
-    console.print(f"[dim]KB enumeration source: {kb_source}, count={len(installed_kbs)}[/dim]\n")
+    console.print(f"KB enumeration source: [italic]{kb_source}[/italic]")
+    console.print(f"Installed KBs: {len(installed_kbs)}\n")
 
-    # Stage 2: Catalog discovery
-    catalog_kbs = discover_kbs_from_catalog(os_name, bitness)
+    # 3) Catalog KBs for this OS/bitness
+    catalog_kbs = discover_catalog_kbs(os_name, bitness)
+    if not catalog_kbs:
+        console.print("[bold red]No catalog KBs discovered – cannot continue.[/bold red]")
+        return
 
-    # Stage 3: diff
-    missing_kbs = find_missing_kbs(installed_kbs, catalog_kbs)
+    # 4) Compute missing vs installed (relative to catalog)
+    catalog_set = set(catalog_kbs)
+    installed_in_catalog = sorted(catalog_set & installed_kbs, key=int)
+    missing_kbs = sorted(catalog_set - installed_kbs, key=int)
 
-    # Stage 4: display
-    display_missing_kbs(missing_kbs, installed_kbs, os_name, bitness)
+    console.print(
+        f"\nFound [bold]{len(missing_kbs)}[/bold] catalog KBs "
+        f"not installed on this system."
+    )
 
-    # JSON report for Master / later hotfixer module
-    report_payload: Dict = {
+    # 5) For all catalog KBs, fetch CVEs
+    kb_details: List[Dict] = []
+    for kb in catalog_kbs:
+        status = "Missing" if kb in missing_kbs else "Installed"
+        console.print(f"[*] Resolving CVEs for KB{kb} ({status})...")
+        cves = fetch_kb_cves(kb)
+        kb_details.append(
+            {
+                "kb": kb,
+                "status": status,
+                "cves": cves,
+            }
+        )
+
+    # 6) Display table
+    console.print(
+        f"\nOS: {os_name} ({bitness}), "
+        f"Installed KBs: {len(installed_kbs)}\n"
+    )
+    display_kb_table(kb_details)
+
+    # 7) Save JSON outputs
+    results_payload = {
         "tool": "WinShield",
-        "mode": "catalog_kb_diff",
         "scan_date": datetime.now().isoformat(),
-        "os_info": {
-            "name": os_name,
-            "version": os_version,
-            "build": build,
-            "bitness": bitness,
-        },
+        "os_name": os_name,
+        "build": build,
+        "bitness": bitness,
         "kb_enumeration_source": kb_source,
-        "installed_kb_count": len(installed_kbs),
-        "catalog_kb_count": len(catalog_kbs),
-        "installed_kbs_sample": sorted(list(installed_kbs))[:50],
-        "missing_kbs": sorted(list(missing_kbs)),
+        "installed_kbs": sorted(list(installed_kbs), key=int),
+        "catalog_kbs": catalog_kbs,
+        "missing_kbs": missing_kbs,
+        "kb_details": kb_details,
     }
 
-    with open("scanner_results.json", "w", encoding="utf-8") as fh:
-        json.dump(report_payload, fh, indent=2, ensure_ascii=False)
+    with open(SCANNER_RESULTS_JSON, "w", encoding="utf-8") as fh:
+        json.dump(results_payload, fh, indent=2, ensure_ascii=False)
 
-    console.print(f"\n[dim]Results saved to scanner_results.json[/dim]")
-    console.print(f"[dim]Log saved to {LOG_FILE_NAME}[/dim]")
+    with open(KB_METADATA_JSON, "w", encoding="utf-8") as fh:
+        json.dump(kb_details, fh, indent=2, ensure_ascii=False)
+
+    console.print(f"\n[dim]Scanner results saved to {SCANNER_RESULTS_JSON}[/dim]")
+    console.print(f"[dim]KB metadata saved to {KB_METADATA_JSON}[/dim]\n")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-        input("\nPress Enter to exit...")
-    finally:
-        # Restore original stdout/stderr so shutdown does not try to flush TeeStream
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-        try:
-            _log_file_handle.flush()
-            _log_file_handle.close()
-        except Exception:
-            pass
+    main()
+    input("Press Enter to exit...")

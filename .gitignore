@@ -32,4 +32,5 @@ desktop.ini
 notes.txt
 scanner3.py
 scanner.py
-WinShield_Scanner_Debug.py
+WinShield_Scanner_MSRC.py
+WinShield_Scanner_MU.py
