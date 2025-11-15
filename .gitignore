@@ -9,6 +9,7 @@ __pycache__/
 # No need to commit my personal scan results
 scanner_results.json
 controller_results.json
+kb_metadata.json
 
 # Log files - useful for debugging but not part of the actual code
 # These get messy and change constantly, don't belong in version control
@@ -34,3 +35,11 @@ scanner3.py
 scanner.py
 WinShield_Scanner_MSRC.py
 WinShield_Scanner_MU.py
+works-WinShield_Controller.ps1
+works-WinShield_Master.ps1
+works-WinShield_Scanner.ps1
+checkpoint-logic_works/
+checkpoint-turned_python
+python-winshield_master.py
+python-winshield_scanner.py
+python-winshield_controller.py

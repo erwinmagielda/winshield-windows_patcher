@@ -148,45 +148,6 @@ $items | ConvertTo-Json -Depth 2
     console.print("[!] Could not enumerate installed KBs – treating system as unpatched.")
     return set(), "None"
 
-
-def discover_catalog_kbs(os_name: str, bitness: str) -> List[str]:
-    """
-    Hit Microsoft Update Catalog search and scrape KB numbers.
-    We keep this intentionally simple: search for
-       '<os_name> for x64-based Systems'
-    or
-       '<os_name> for x86-based Systems'
-    then regex KB\d+ from the HTML.
-    """
-    arch_str = "x64-based Systems" if "64" in bitness else "x86-based Systems"
-    query = f"{os_name} for {arch_str}"
-
-    console.print(
-        "[*] Querying Microsoft Update Catalog for: "
-        f"[bold green]'{query}'[/bold green]"
-    )
-
-    search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
-    params = {"q": query}
-    headers = {"User-Agent": USER_AGENT}
-
-    try:
-        resp = requests.get(search_url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except Exception as exc:
-        console.print(f"[bold red]ERROR:[/bold red] Failed to query Update Catalog: {exc!r}")
-        return []
-
-    html = resp.text
-    kb_matches = re.findall(r"KB(\d{6,})", html, re.IGNORECASE)
-    unique_kbs = sorted(set(kb_matches), key=int)
-
-    console.print(
-        f"[+] Discovered {len(unique_kbs)} catalog KBs for this OS/bitness (before diff)"
-    )
-    return unique_kbs
-
-
 def fetch_kb_cves(kb_id: str) -> List[str]:
     """
     Try to discover CVEs fixed by a given KB using support.microsoft.com/help/<KB>.
@@ -218,6 +179,126 @@ def fetch_kb_cves(kb_id: str) -> List[str]:
 
     return sorted(cves)
 
+def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
+    """
+    Query the Microsoft Update Catalog for KBs that match this OS and architecture.
+
+    Strategy:
+      - Derive a base OS name (for example "Windows 11" from "Microsoft Windows 11 Home").
+      - Map the build to a rough "Version XXH2" label where possible.
+      - Try a small set of search queries in order, stop on the first one that returns KBs.
+    """
+
+    def normalise_windows_name(name: str) -> str:
+        # Strip vendor prefix
+        name = name.replace("Microsoft", "").strip()
+        # Reduce editions to a core product family
+        if "Windows 11" in name:
+            return "Windows 11"
+        if "Windows 10" in name:
+            return "Windows 10"
+        if "Windows 8.1" in name:
+            return "Windows 8.1"
+        if "Windows 7" in name:
+            return "Windows 7"
+        return name
+
+    def map_build_to_release(base_name: str, build_str: str) -> Optional[str]:
+        try:
+            b = int(build_str)
+        except (TypeError, ValueError):
+            return None
+
+        # Very rough but good enough for supported builds
+        if "Windows 11" in base_name:
+            if b >= 26100:
+                return "Version 24H2"
+            if b >= 22631:
+                return "Version 23H2"
+            if b >= 22621:
+                return "Version 22H2"
+            if b >= 22000:
+                return "Version 21H2"
+
+        if "Windows 10" in base_name:
+            if b >= 19045:
+                return "Version 22H2"
+            if b >= 19044:
+                return "Version 21H2"
+            if b >= 19043:
+                return "Version 21H1"
+            if b >= 19042:
+                return "Version 20H2"
+            if b >= 19041:
+                return "Version 2004"
+
+        return None
+
+    base_name = normalise_windows_name(os_name)
+    arch_str = "x64-based Systems" if "64" in bitness else "x86-based Systems"
+    release_label = map_build_to_release(base_name, build)
+
+    # We try a few increasingly loose queries. First one that returns KBs wins.
+    queries: List[str] = []
+
+    if release_label:
+        # Highest fidelity: "Windows 11 Version 24H2 for x64-based Systems"
+        queries.append(f"{base_name} {release_label} for {arch_str}")
+        # Slightly looser
+        queries.append(f"{base_name} {release_label}")
+
+    # Generic fallbacks
+    queries.append(f"{base_name} for {arch_str}")
+    queries.append(f"{base_name} {arch_str}")
+    queries.append(base_name)
+
+    search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
+    headers = {"User-Agent": USER_AGENT}
+
+    all_kbs: Set[str] = set()
+    used_query: Optional[str] = None
+
+    for q in queries:
+        console.print(
+            "[*] Querying Microsoft Update Catalog for: "
+            f"[bold green]'{q}'[/bold green]"
+        )
+        try:
+            resp = requests.get(
+                search_url,
+                params={"q": q},
+                headers=headers,
+                timeout=HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            console.print(
+                f"[bold red]ERROR:[/bold red] Failed to query Update Catalog with '{q}': {exc!r}"
+            )
+            continue
+
+        html = resp.text
+        kb_matches = re.findall(r"KB(\d{5,7})", html, re.IGNORECASE)
+        unique_kbs = sorted(set(kb_matches), key=int)
+
+        console.print(f"    Found {len(unique_kbs)} KBs for query '{q}'")
+
+        if unique_kbs:
+            all_kbs.update(unique_kbs)
+            used_query = q
+            break  # first successful query wins
+
+    if not all_kbs:
+        console.print(
+            "[bold red]No catalog KBs discovered for any query – cannot continue.[/bold red]"
+        )
+        return []
+
+    console.print(
+        f"[+] Discovered {len(all_kbs)} catalog KBs "
+        f"using query [italic]'{used_query}'[/italic] (before diff)"
+    )
+    return sorted(all_kbs, key=int)
 
 # -------------------------------------------------------------------
 # Display
@@ -283,7 +364,7 @@ def main() -> None:
     console.print(f"Installed KBs: {len(installed_kbs)}\n")
 
     # 3) Catalog KBs for this OS/bitness
-    catalog_kbs = discover_catalog_kbs(os_name, bitness)
+    catalog_kbs = discover_catalog_kbs(os_name, bitness, build)
     if not catalog_kbs:
         console.print("[bold red]No catalog KBs discovered – cannot continue.[/bold red]")
         return
