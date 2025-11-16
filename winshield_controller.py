@@ -1,13 +1,14 @@
 # WinShield_Controller.py
 """
 WinShield_Controller (Python Edition)
-- Detect OS name, version, build, bitness (using PowerShell, like the PS version)
-- Detect PowerShell version
-- Assume Python is present (we're already running in it)
-- Ensure Python dependencies are installed (requests, rich, python-dateutil)
-- Write controller_results.json in the same schema as the PowerShell controller
 
-This is intentionally close in spirit to the original PowerShell logic.
+- Detect OS name, version, build, bitness (via PowerShell, like the PS controller)
+- Detect PowerShell version
+- Assume Python is present (we are already running in it)
+- Ensure Python dependencies are installed (requests, rich, python-dateutil)
+- Write controller_results.json in the same schema as before
+
+controller_results.json is always overwritten: it represents the current environment only.
 """
 
 import json
@@ -16,10 +17,6 @@ import platform
 import subprocess
 import sys
 from typing import Any, Dict, List, Tuple
-
-# ============================================================
-# Rich console setup (with graceful fallback)
-# ============================================================
 
 try:
     from rich.console import Console
@@ -66,17 +63,9 @@ def Fail(msg: str) -> None:
     sys.exit(1)
 
 
-# ============================================================
-# Paths / globals
-# ============================================================
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULT_FILE = os.path.join(SCRIPT_DIR, "controller_results.json")
 
-
-# ============================================================
-# OS + PowerShell detection (mirrors PS logic as closely as possible)
-# ============================================================
 
 def _run_powershell(ps_script: str, timeout: int = 30) -> Tuple[int, str, str]:
     try:
@@ -101,7 +90,7 @@ def _run_powershell(ps_script: str, timeout: int = 30) -> Tuple[int, str, str]:
 def detect_os() -> Tuple[str, str, str, str]:
     """
     Use PowerShell Get-CimInstance/Win32_OperatingSystem like the original controller.
-    Falls back to Python's platform module if that fails.
+    Fall back to Python platform() if that fails.
     Returns: (os_name, os_version, build, bitness)
     """
     ps_script = r"""
@@ -111,14 +100,13 @@ try {
     $os = Get-WmiObject Win32_OperatingSystem
 }
 $props = [PSCustomObject]@{
-    Caption       = $os.Caption
-    Version       = $os.Version
-    BuildNumber   = $os.BuildNumber
+    Caption        = $os.Caption
+    Version        = $os.Version
+    BuildNumber    = $os.BuildNumber
     OSArchitecture = $os.OSArchitecture
 }
 $props | ConvertTo-Json -Depth 2
 """
-
     rc, out_text, err_text = _run_powershell(ps_script)
     if rc == 0 and out_text.strip():
         try:
@@ -128,32 +116,23 @@ $props | ConvertTo-Json -Depth 2
             os_version = str(data.get("Version", "")).strip() or ""
             build = str(data.get("BuildNumber", "")).strip() or ""
             bitness = str(data.get("OSArchitecture", "")).strip()
-
-            # Normalise bitness if needed
             if not bitness:
                 bitness = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-
             Good(f"Detected: {os_name} ({os_version}) Build {build} [{bitness}]")
             return os_name, os_version, build, bitness
         except Exception as exc:
             Warn(f"PowerShell OS JSON parse failed: {exc!r}")
 
     Warn("PowerShell OS detection failed, falling back to Python platform().")
-
     os_name = f"Microsoft {platform.system()}"
     os_version = platform.version()
     build = ""
     bitness = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-
     Good(f"Detected: {os_name} ({os_version}) Build {build} [{bitness}]")
     return os_name, os_version, build, bitness
 
 
 def detect_powershell_version() -> int:
-    """
-    Try to detect major PowerShell version via $PSVersionTable.PSVersion.Major.
-    If detection fails, return 0 (unknown).
-    """
     ps_script = r"$PSVersionTable.PSVersion.Major"
     rc, out_text, err_text = _run_powershell(ps_script)
     if rc == 0 and out_text.strip():
@@ -163,33 +142,18 @@ def detect_powershell_version() -> int:
             return version
         except Exception:
             Warn("Could not parse PowerShell version, defaulting to 0.")
-            return 0
     else:
         Warn("PowerShell version detection failed, defaulting to 0.")
-        return 0
+    return 0
 
-
-# ============================================================
-# Dependency handling
-# ============================================================
 
 def ensure_python_dependencies(errors: List[str]) -> bool:
-    """
-    Ensure required Python modules are installed.
-    - requests
-    - rich
-    - python-dateutil (imported as 'dateutil')
-
-    Uses 'python -m pip install ...' logic similar to the PS controller's pip calls.
-    """
     modules = [
         ("requests", "requests"),
         ("rich", "rich"),
         ("python-dateutil", "dateutil"),
     ]
-
     deps_ok = True
-
     for pip_name, import_name in modules:
         try:
             __import__(import_name)
@@ -204,8 +168,8 @@ def ensure_python_dependencies(errors: List[str]) -> bool:
                 )
                 if proc.returncode != 0:
                     errors.append(
-                        f"Python dependency '{pip_name}' failed to install. "
-                        f"pip exit code {proc.returncode}."
+                        f"Python dependency '{pip_name}' failed to install "
+                        f"(pip exit code {proc.returncode})."
                     )
                     Warn(f"pip install '{pip_name}' failed.")
                     deps_ok = False
@@ -217,43 +181,26 @@ def ensure_python_dependencies(errors: List[str]) -> bool:
                 )
                 Warn(f"Exception while installing '{pip_name}': {exc!r}")
                 deps_ok = False
-
     return deps_ok
 
 
-# ============================================================
-# Main
-# ============================================================
-
 def main() -> None:
     errors: List[str] = []
-
     Info("WinShield Controller (Python) starting...")
 
-    # 1) OS Detection
     os_name, os_version, build, bitness = detect_os()
-
-    # 2) PowerShell version
     ps_version = detect_powershell_version()
 
-    # 3) Python detection (we are already running in Python)
     python_ok = True
     Good("Python status: OK")
 
-    # 4) Python dependencies
     Info("Checking Python modules...")
     deps_ok = ensure_python_dependencies(errors)
 
-    # 5) Final readiness decision
     ready = True
-    if not python_ok:
-        ready = False
-    if not deps_ok:
-        ready = False
-    if errors:
+    if not python_ok or not deps_ok or errors:
         ready = False
 
-    # 6) Write controller_results.json (same schema as PS)
     payload: Dict[str, Any] = {
         "ready": ready,
         "errors": errors,

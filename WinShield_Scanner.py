@@ -1,14 +1,18 @@
+# WinShield_Scanner.py
 """
-WinShield - Windows Vulnerability Scanner (KB→CVE Edition)
+WinShield - Windows Vulnerability Scanner (KB to CVE, Catalog based)
 
 Pipeline:
   1) Read controller_results.json (OS name, build, bitness)
   2) Get installed KBs via PowerShell Get-HotFix
-  3) Query Microsoft Update Catalog for this OS/bitness → list of KBs
-  4) For each KB, fetch support.microsoft.com/help/<KB> and extract CVE IDs
+  3) Query Microsoft Update Catalog for this OS/bitness
+  4) For each catalog KB, optionally fetch CVEs from support.microsoft.com/help/<KB>
   5) Compare installed vs catalog KBs
-  6) Show table: ID | KB | Status | CVEs (fixed by this KB)
-  7) Save scanner_results.json + kb_metadata.json
+  6) Show table of catalog KBs with status
+  7) Save scan snapshots:
+     - scanner_results.json (last run)
+     - kb_metadata.json
+     - scans/scan_<system_tag>-<timestamp>.json (archived snapshot)
 """
 
 import json
@@ -23,16 +27,15 @@ import requests
 from rich.console import Console
 from rich.table import Table
 
-# -------------------------------------------------------------------
-# Config
-# -------------------------------------------------------------------
-
 POWERSHELL_TIMEOUT = 60
 HTTP_TIMEOUT = 20
 
-CONTROLLER_JSON = "controller_results.json"
-SCANNER_RESULTS_JSON = "scanner_results.json"
-KB_METADATA_JSON = "kb_metadata.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONTROLLER_JSON = os.path.join(SCRIPT_DIR, "controller_results.json")
+SCANNER_RESULTS_JSON = os.path.join(SCRIPT_DIR, "scanner_results.json")
+KB_METADATA_JSON = os.path.join(SCRIPT_DIR, "kb_metadata.json")
+SCANS_DIR = os.path.join(SCRIPT_DIR, "scans")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -43,15 +46,7 @@ USER_AGENT = (
 console = Console()
 
 
-# -------------------------------------------------------------------
-# Helper functions
-# -------------------------------------------------------------------
-
 def load_controller_env(path: str = CONTROLLER_JSON) -> Dict:
-    """
-    Load controller_results.json written by WinShield_Controller.
-    Accepts UTF-8 with or without BOM.
-    """
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
@@ -86,11 +81,10 @@ def run_powershell(ps_command: str, timeout: int = POWERSHELL_TIMEOUT) -> Tuple[
 def get_installed_kbs() -> Tuple[Set[str], str]:
     """
     Enumerate installed KBs (numeric IDs, no 'KB' prefix).
-    Uses Get-HotFix and falls back to WMIC if needed.
+    Uses Get-HotFix, falls back to WMIC if needed.
     """
     console.print("[*] Enumerating installed patches...")
 
-    # --- Attempt 1: Get-HotFix via PowerShell ---
     ps_script = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $items = Get-HotFix | Select-Object HotFixID
@@ -114,13 +108,12 @@ $items | ConvertTo-Json -Depth 2
                     console.print(f"[+] Found {len(kbs)} KBs via Get-HotFix")
                     return kbs, "Get-HotFix"
             except json.JSONDecodeError:
-                console.print("[!] Get-HotFix JSON parse failed; falling back")
+                console.print("[!] Get-HotFix JSON parse failed, falling back")
         else:
-            console.print("[!] Get-HotFix returned empty output; falling back")
+            console.print("[!] Get-HotFix returned empty output, falling back")
     else:
         console.print(f"[!] Get-HotFix error: {err_text.strip() or 'unknown'}")
 
-    # --- Attempt 2: WMIC QFE ---
     try:
         proc = subprocess.run(
             ["wmic", "qfe", "get", "HotFixID", "/format:csv"],
@@ -145,54 +138,21 @@ $items | ConvertTo-Json -Depth 2
     except Exception as exc:
         console.print(f"[!] WMIC attempt failed: {exc!r}")
 
-    console.print("[!] Could not enumerate installed KBs – treating system as unpatched.")
+    console.print("[!] Could not enumerate installed KBs, treating system as unpatched.")
     return set(), "None"
 
-def fetch_kb_cves(kb_id: str) -> List[str]:
-    """
-    Try to discover CVEs fixed by a given KB using support.microsoft.com/help/<KB>.
-    We simply look for CVE-YYYY-NNNN patterns in the page content.
-    """
-    urls = [
-        f"https://support.microsoft.com/help/{kb_id}",
-        f"https://support.microsoft.com/en-us/help/{kb_id}",
-    ]
-    headers = {"User-Agent": USER_AGENT}
-    cves: Set[str] = set()
-
-    for url in urls:
-        try:
-            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-
-        # Extract CVE IDs
-        matches = re.findall(r"CVE-\d{4}-\d{4,7}", resp.text, re.IGNORECASE)
-        for m in matches:
-            cves.add(m.upper())
-
-        # If we found some, no need to try more URLs
-        if cves:
-            break
-
-    return sorted(cves)
 
 def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
     """
-    Query the Microsoft Update Catalog for KBs that match this OS and architecture.
+    Query Microsoft Update Catalog and scrape KB numbers for this OS platform.
 
-    Strategy:
-      - Derive a base OS name (for example "Windows 11" from "Microsoft Windows 11 Home").
-      - Map the build to a rough "Version XXH2" label where possible.
-      - Try a small set of search queries in order, stop on the first one that returns KBs.
+    - Normalise Windows name (Windows 11, Windows 10, etc.)
+    - Map build number to Version 24H2 / 23H2 / 22H2 / 21H2 where possible
+    - Try a small sequence of search queries, stop on the first that returns KBs
     """
 
     def normalise_windows_name(name: str) -> str:
-        # Strip vendor prefix
         name = name.replace("Microsoft", "").strip()
-        # Reduce editions to a core product family
         if "Windows 11" in name:
             return "Windows 11"
         if "Windows 10" in name:
@@ -209,7 +169,6 @@ def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
         except (TypeError, ValueError):
             return None
 
-        # Very rough but good enough for supported builds
         if "Windows 11" in base_name:
             if b >= 26100:
                 return "Version 24H2"
@@ -238,16 +197,10 @@ def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
     arch_str = "x64-based Systems" if "64" in bitness else "x86-based Systems"
     release_label = map_build_to_release(base_name, build)
 
-    # We try a few increasingly loose queries. First one that returns KBs wins.
     queries: List[str] = []
-
     if release_label:
-        # Highest fidelity: "Windows 11 Version 24H2 for x64-based Systems"
         queries.append(f"{base_name} {release_label} for {arch_str}")
-        # Slightly looser
         queries.append(f"{base_name} {release_label}")
-
-    # Generic fallbacks
     queries.append(f"{base_name} for {arch_str}")
     queries.append(f"{base_name} {arch_str}")
     queries.append(base_name)
@@ -280,29 +233,55 @@ def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
         html = resp.text
         kb_matches = re.findall(r"KB(\d{5,7})", html, re.IGNORECASE)
         unique_kbs = sorted(set(kb_matches), key=int)
-
         console.print(f"    Found {len(unique_kbs)} KBs for query '{q}'")
 
         if unique_kbs:
             all_kbs.update(unique_kbs)
             used_query = q
-            break  # first successful query wins
+            break
 
     if not all_kbs:
         console.print(
-            "[bold red]No catalog KBs discovered for any query – cannot continue.[/bold red]"
+            "[bold red]No catalog KBs discovered for any query, cannot continue.[/bold red]"
         )
         return []
 
     console.print(
-        f"[+] Discovered {len(all_kbs)} catalog KBs "
-        f"using query [italic]'{used_query}'[/italic] (before diff)"
+        f"[+] Discovered {len(all_kbs)} catalog KBs using query "
+        f"[italic]'{used_query}'[/italic] (before diff)"
     )
     return sorted(all_kbs, key=int)
 
-# -------------------------------------------------------------------
-# Display
-# -------------------------------------------------------------------
+
+def fetch_kb_cves(kb_id: str) -> List[str]:
+    """
+    Try to discover CVEs fixed by a given KB using support.microsoft.com/help/<KB>.
+    We simply look for CVE-YYYY-NNNN patterns in the page content.
+    """
+    urls = [
+        f"https://support.microsoft.com/help/{kb_id}",
+        f"https://support.microsoft.com/en-us/help/{kb_id}",
+    ]
+    headers = {"User-Agent": USER_AGENT}
+    cves: Set[str] = set()
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+
+        matches = re.findall(r"CVE-\d{4}-\d{4,7}", resp.text, re.IGNORECASE)
+        for m in matches:
+            cves.add(m.upper())
+
+        if cves:
+            break
+
+    return sorted(cves)
+
 
 def display_kb_table(kb_details: List[Dict]) -> None:
     if not kb_details:
@@ -328,7 +307,6 @@ def display_kb_table(kb_details: List[Dict]) -> None:
         status_text = f"[{status_style}]{status}[/{status_style}]"
 
         if cves:
-            # Join CVEs but avoid an absurdly long column
             cve_text = ", ".join(cves)
             if len(cve_text) > 80:
                 cve_text = cve_text[:77] + "..."
@@ -340,14 +318,27 @@ def display_kb_table(kb_details: List[Dict]) -> None:
     console.print(table)
 
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
+def make_system_tag(controller_env: Dict) -> str:
+    os_name = str(controller_env.get("os_name", "windows")).lower()
+    build = str(controller_env.get("build", "")).strip()
+    bitness = str(controller_env.get("bitness", "")).lower().replace(" ", "")
+
+    os_name = os_name.replace("microsoft", "")
+    os_name = re.sub(r"[^a-z0-9]+", "_", os_name)
+    os_name = re.sub(r"_+", "_", os_name).strip("_")
+
+    parts = [os_name]
+    if build:
+        parts.append(build)
+    if bitness:
+        parts.append(bitness)
+
+    return "_".join(parts) or "windows_unknown"
+
 
 def main() -> None:
     console.print("[bold cyan]WinShield - Windows Vulnerability Scanner[/bold cyan]\n")
 
-    # 1) Load environment from controller
     env = load_controller_env()
     os_name = env.get("os_name", "Unknown Windows")
     build = env.get("build", "Unknown")
@@ -358,28 +349,22 @@ def main() -> None:
         f"(build {build}, {bitness})\n"
     )
 
-    # 2) Installed KBs
     installed_kbs, kb_source = get_installed_kbs()
     console.print(f"KB enumeration source: [italic]{kb_source}[/italic]")
-    console.print(f"Installed KBs: {len(installed_kbs)}\n")
+    console.print(f"Installed KBs (local): {len(installed_kbs)}\n")
 
-    # 3) Catalog KBs for this OS/bitness
     catalog_kbs = discover_catalog_kbs(os_name, bitness, build)
     if not catalog_kbs:
-        console.print("[bold red]No catalog KBs discovered – cannot continue.[/bold red]")
         return
 
-    # 4) Compute missing vs installed (relative to catalog)
     catalog_set = set(catalog_kbs)
     installed_in_catalog = sorted(catalog_set & installed_kbs, key=int)
     missing_kbs = sorted(catalog_set - installed_kbs, key=int)
 
     console.print(
-        f"\nFound [bold]{len(missing_kbs)}[/bold] catalog KBs "
-        f"not installed on this system."
+        f"\nFound [bold]{len(missing_kbs)}[/bold] catalog KBs not installed on this system."
     )
 
-    # 5) For all catalog KBs, fetch CVEs
     kb_details: List[Dict] = []
     for kb in catalog_kbs:
         status = "Missing" if kb in missing_kbs else "Installed"
@@ -389,41 +374,86 @@ def main() -> None:
             {
                 "kb": kb,
                 "status": status,
+                "in_local_hotfix": kb in installed_kbs,
+                "in_catalog": True,
                 "cves": cves,
+                "notes": [],
             }
         )
 
-    # 6) Display table
     console.print(
-        f"\nOS: {os_name} ({bitness}), "
-        f"Installed KBs: {len(installed_kbs)}\n"
+        f"\nOS: {os_name} ({bitness}), Installed KBs (local): {len(installed_kbs)}\n"
     )
     display_kb_table(kb_details)
 
-    # 7) Save JSON outputs
-    results_payload = {
+    scan_date = datetime.now().replace(microsecond=0).isoformat()
+    system_tag = make_system_tag(env)
+    scan_id = f"{system_tag}-{scan_date.replace(':', '-')}"
+
+    summary = {
+        "catalog_kbs_total": len(catalog_kbs),
+        "installed_kbs_local_total": len(installed_kbs),
+        "installed_kbs_in_catalog": len(installed_in_catalog),
+        "missing_kbs_count": len(missing_kbs),
+    }
+
+    kb_sets = {
+        "installed_kbs_local": sorted(list(installed_kbs), key=int),
+        "catalog_kbs": catalog_kbs,
+        "missing_kbs": missing_kbs,
+        "installed_kbs_in_catalog": installed_in_catalog,
+    }
+
+    controller_env = {
+        "os_name": env.get("os_name"),
+        "os_version": env.get("os_version"),
+        "build": env.get("build"),
+        "bitness": env.get("bitness"),
+        "powershell_version": env.get("powershell_version"),
+        "python_ok": env.get("python_ok"),
+        "deps_ok": env.get("deps_ok"),
+    }
+
+    scan_payload: Dict = {
         "tool": "WinShield",
-        "scan_date": datetime.now().isoformat(),
+        "schema_version": 2,
+        "scan_id": scan_id,
+        "scan_date": scan_date,
+        "system_tag": system_tag,
+        "controller_env": controller_env,
+        "summary": summary,
+        "kb_sets": kb_sets,
+        "kb_details": kb_details,
+        # Backwards compatible top level fields
         "os_name": os_name,
         "build": build,
         "bitness": bitness,
         "kb_enumeration_source": kb_source,
-        "installed_kbs": sorted(list(installed_kbs), key=int),
+        "installed_kbs": kb_sets["installed_kbs_local"],
         "catalog_kbs": catalog_kbs,
         "missing_kbs": missing_kbs,
-        "kb_details": kb_details,
     }
 
+    os.makedirs(SCANS_DIR, exist_ok=True)
+    snapshot_name = f"scan_{scan_id}.json"
+    snapshot_path = os.path.join(SCANS_DIR, snapshot_name)
+    scan_payload["snapshot_file"] = snapshot_path
+
     with open(SCANNER_RESULTS_JSON, "w", encoding="utf-8") as fh:
-        json.dump(results_payload, fh, indent=2, ensure_ascii=False)
+        json.dump(scan_payload, fh, indent=2, ensure_ascii=False)
 
     with open(KB_METADATA_JSON, "w", encoding="utf-8") as fh:
         json.dump(kb_details, fh, indent=2, ensure_ascii=False)
 
+    with open(snapshot_path, "w", encoding="utf-8") as fh:
+        json.dump(scan_payload, fh, indent=2, ensure_ascii=False)
+
     console.print(f"\n[dim]Scanner results saved to {SCANNER_RESULTS_JSON}[/dim]")
-    console.print(f"[dim]KB metadata saved to {KB_METADATA_JSON}[/dim]\n")
+    console.print(f"[dim]KB metadata saved to {KB_METADATA_JSON}[/dim]")
+    console.print(f"[dim]Snapshot saved to {snapshot_path}[/dim]\n")
+
+    input("Press Enter to exit...")
 
 
 if __name__ == "__main__":
     main()
-    input("Press Enter to exit...")
