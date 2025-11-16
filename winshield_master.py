@@ -2,12 +2,12 @@
 """
 WinShield Master Orchestrator (Python Edition)
 
-- Auto run Controller to verify environment
-- Let user choose:
-    1) Run Scan
-    2) Existing Snapshot
+- Auto runs WinShield_Controller.py to verify environment
+- Then lets the user choose:
+    1) Run Scan      → runs WinShield_Scanner.py, uses the new snapshot
+    2) Existing Snapshot → shows a table of saved scans, user picks one by ID
     3) Exit
-- Pass selected snapshot to WinShield_Manager.py
+- If WinShield_Manager.py exists, it is launched with the chosen snapshot path.
 """
 
 import json
@@ -32,6 +32,10 @@ except Exception:
 
     console = DummyConsole()
 
+
+# --------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------
 
 def Info(msg: str) -> None:
     if RICH_AVAILABLE:
@@ -65,7 +69,7 @@ def Fail(msg: str) -> None:
 def Ask_Choice(prompt: str, choices: List[str]) -> int:
     """
     Simple numeric choice helper.
-    Returns index (1 based) chosen by user.
+    Returns the chosen index (1-based).
     """
     while True:
         if prompt:
@@ -114,7 +118,7 @@ def load_json(path: str) -> Dict[str, Any]:
 def select_snapshot_file() -> Optional[str]:
     """
     Let user select an existing scan snapshot by ID.
-    Returns the selected file path, or None if there are no snapshots.
+    Returns the selected file path, or None if cancelled / none exist.
     """
     if not os.path.isdir(SCANS_DIR):
         Warn("No scans directory found, there are no saved snapshots.")
@@ -143,6 +147,7 @@ def select_snapshot_file() -> Optional[str]:
             system_tag = data.get("system_tag", "unknown")
             scan_date = data.get("scan_date", "unknown date")
             missing = summary.get("missing_kbs_count", "n/a")
+            catalog_total = summary.get("catalog_kbs_total", "n/a")
             entries.append(
                 {
                     "path": path,
@@ -150,6 +155,7 @@ def select_snapshot_file() -> Optional[str]:
                     "system_tag": system_tag,
                     "scan_date": scan_date,
                     "missing": missing,
+                    "catalog_total": catalog_total,
                 }
             )
         except Exception:
@@ -170,6 +176,7 @@ def select_snapshot_file() -> Optional[str]:
         table.add_column("File")
         table.add_column("System")
         table.add_column("Date")
+        table.add_column("KBs", justify="right")
         table.add_column("Missing KBs", justify="right")
 
         for idx, e in enumerate(entries, start=1):
@@ -178,6 +185,7 @@ def select_snapshot_file() -> Optional[str]:
                 e["file"],
                 e["system_tag"],
                 e["scan_date"],
+                str(e["catalog_total"]),
                 str(e["missing"]),
             )
 
@@ -187,7 +195,8 @@ def select_snapshot_file() -> Optional[str]:
         for idx, e in enumerate(entries, start=1):
             print(
                 f"{idx}) {e['file']}  "
-                f"[system={e['system_tag']}, date={e['scan_date']}, missing={e['missing']}]"
+                f"[system={e['system_tag']}, date={e['scan_date']}, "
+                f"catalog_kbs={e['catalog_total']}, missing={e['missing']}]"
             )
 
     while True:
@@ -201,13 +210,18 @@ def select_snapshot_file() -> Optional[str]:
         Warn("Please enter a valid snapshot ID.")
 
 
+# --------------------------------------------------------------
+# Main
+# --------------------------------------------------------------
+
 def main() -> None:
+    # Clear screen
     if os.name == "nt":
         os.system("cls")
     else:
         os.system("clear")
 
-    # Top banner
+    # Banner
     if RICH_AVAILABLE:
         console.print("========= WinShield =========", style="bold cyan")
     else:
@@ -258,6 +272,7 @@ def main() -> None:
         Fail("User exited.")
 
     if choice == 1:
+        # Run new scan
         if not os.path.isfile(SCANNER_PATH):
             Fail(f"Scanner file missing: {SCANNER_PATH}")
 
@@ -280,11 +295,12 @@ def main() -> None:
             snapshot_path = SCANNER_RESULTS_JSON
 
     elif choice == 2:
+        # Use existing snapshot
         snapshot_path = select_snapshot_file()
         if not snapshot_path:
             Fail("No snapshot selected, cannot continue.")
 
-    # 3) Launch Manager with selected snapshot
+    # 3) Launch Manager with selected snapshot (optional)
     if not os.path.isfile(MANAGER_PATH):
         Warn("Manager file (WinShield_Manager.py) not found, nothing more to do.")
         Good("WinShield Master complete.")
