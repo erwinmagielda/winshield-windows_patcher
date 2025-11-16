@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import requests
 from rich.console import Console
 from rich.table import Table
+from rich.progress import Progress
 
 POWERSHELL_TIMEOUT = 60
 HTTP_TIMEOUT = 20
@@ -233,7 +234,6 @@ def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
         html = resp.text
         kb_matches = re.findall(r"KB(\d{5,7})", html, re.IGNORECASE)
         unique_kbs = sorted(set(kb_matches), key=int)
-        console.print(f"    Found {len(unique_kbs)} KBs for query '{q}'")
 
         if unique_kbs:
             all_kbs.update(unique_kbs)
@@ -248,7 +248,7 @@ def discover_catalog_kbs(os_name: str, bitness: str, build: str) -> List[str]:
 
     console.print(
         f"[+] Discovered {len(all_kbs)} catalog KBs using query "
-        f"[italic]'{used_query}'[/italic] (before diff)"
+        f"[italic]'{used_query}'[/italic]"
     )
     return sorted(all_kbs, key=int)
 
@@ -283,20 +283,20 @@ def fetch_kb_cves(kb_id: str) -> List[str]:
     return sorted(cves)
 
 
-def display_kb_table(kb_details: List[Dict]) -> None:
+def display_kb_table(kb_details: List[Dict], title: str) -> None:
     if not kb_details:
         console.print("[bold yellow]No catalog KBs to display.[/bold yellow]")
         return
 
     table = Table(
-        title="Missing KBs (from Microsoft Update Catalog query)",
+        title=title,
         show_header=True,
         header_style="bold magenta",
     )
     table.add_column("ID", style="dim", width=4)
     table.add_column("KB")
     table.add_column("Status", width=10)
-    table.add_column("CVEs Fixed")
+    table.add_column("CVE(s)")
 
     for idx, kb_info in enumerate(kb_details, start=1):
         kb_str = f"KB{kb_info['kb']}"
@@ -349,9 +349,12 @@ def main() -> None:
         f"(build {build}, {bitness})\n"
     )
 
+    # Prepare scan ID early so we can use it for table title
+    scan_date = datetime.now().replace(microsecond=0).isoformat()
+    system_tag = make_system_tag(env)
+    scan_id = f"{system_tag}-{scan_date.replace(':', '-')}"
+
     installed_kbs, kb_source = get_installed_kbs()
-    console.print(f"KB enumeration source: [italic]{kb_source}[/italic]")
-    console.print(f"Installed KBs (local): {len(installed_kbs)}\n")
 
     catalog_kbs = discover_catalog_kbs(os_name, bitness, build)
     if not catalog_kbs:
@@ -362,33 +365,34 @@ def main() -> None:
     missing_kbs = sorted(catalog_set - installed_kbs, key=int)
 
     console.print(
-        f"\nFound [bold]{len(missing_kbs)}[/bold] catalog KBs not installed on this system."
+        f"\n[+] {len(missing_kbs)} catalog KBs are not installed on this system."
     )
 
     kb_details: List[Dict] = []
-    for kb in catalog_kbs:
-        status = "Missing" if kb in missing_kbs else "Installed"
-        console.print(f"[*] Resolving CVEs for KB{kb} ({status})...")
-        cves = fetch_kb_cves(kb)
-        kb_details.append(
-            {
-                "kb": kb,
-                "status": status,
-                "in_local_hotfix": kb in installed_kbs,
-                "in_catalog": True,
-                "cves": cves,
-                "notes": [],
-            }
+
+    with Progress() as progress:
+        task = progress.add_task(
+            "[cyan]Resolving CVEs for catalog KBs...", total=len(catalog_kbs)
         )
+        for kb in catalog_kbs:
+            status = "Missing" if kb in missing_kbs else "Installed"
+            cves = fetch_kb_cves(kb)
+            kb_details.append(
+                {
+                    "kb": kb,
+                    "status": status,
+                    "in_local_hotfix": kb in installed_kbs,
+                    "in_catalog": True,
+                    "cves": cves,
+                    "notes": [],
+                }
+            )
+            progress.advance(task)
 
-    console.print(
-        f"\nOS: {os_name} ({bitness}), Installed KBs (local): {len(installed_kbs)}\n"
-    )
-    display_kb_table(kb_details)
-
-    scan_date = datetime.now().replace(microsecond=0).isoformat()
-    system_tag = make_system_tag(env)
-    scan_id = f"{system_tag}-{scan_date.replace(':', '-')}"
+    # Table title = snapshot file name
+    snapshot_name = f"scan_{scan_id}.json"
+    console.print()
+    display_kb_table(kb_details, title=snapshot_name)
 
     summary = {
         "catalog_kbs_total": len(catalog_kbs),
@@ -435,7 +439,6 @@ def main() -> None:
     }
 
     os.makedirs(SCANS_DIR, exist_ok=True)
-    snapshot_name = f"scan_{scan_id}.json"
     snapshot_path = os.path.join(SCANS_DIR, snapshot_name)
     scan_payload["snapshot_file"] = snapshot_path
 
@@ -448,10 +451,11 @@ def main() -> None:
     with open(snapshot_path, "w", encoding="utf-8") as fh:
         json.dump(scan_payload, fh, indent=2, ensure_ascii=False)
 
-    console.print(f"\n[dim]Scanner results saved to {SCANNER_RESULTS_JSON}[/dim]")
-    console.print(f"[dim]KB metadata saved to {KB_METADATA_JSON}[/dim]")
-    console.print(f"[dim]Snapshot saved to {snapshot_path}[/dim]\n")
-
+    console.print()
+    console.print(f"Scanner results saved to {SCANNER_RESULTS_JSON}", style="dim")
+    console.print(f"KB metadata saved to {KB_METADATA_JSON}", style="dim")
+    console.print(f"Snapshot saved to {snapshot_path}", style="dim")
+    console.print()
     input("Press Enter to exit...")
 
 

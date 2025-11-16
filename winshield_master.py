@@ -4,14 +4,10 @@ WinShield Master Orchestrator (Python Edition)
 
 - Auto run Controller to verify environment
 - Let user choose:
-    1) Run new Scanner session
-    2) Use existing scan snapshot
+    1) Run Scan
+    2) Existing Snapshot
+    3) Exit
 - Pass selected snapshot to WinShield_Manager.py
-
-WinShield_Manager will later handle:
-- verification against fresh scans
-- view missing or installed KBs
-- patch operations by table ID
 """
 
 import json
@@ -22,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     from rich.console import Console
+    from rich.table import Table
 
     console = Console()
     RICH_AVAILABLE = True
@@ -71,12 +68,13 @@ def Ask_Choice(prompt: str, choices: List[str]) -> int:
     Returns index (1 based) chosen by user.
     """
     while True:
-        if RICH_AVAILABLE:
-            console.print(prompt, style="cyan")
-        else:
-            print(prompt)
+        if prompt:
+            if RICH_AVAILABLE:
+                console.print(prompt, style="cyan")
+            else:
+                print(prompt)
         for idx, label in enumerate(choices, start=1):
-            print(f"  {idx}) {label}")
+            print(f"{idx}) {label}")
         ans = input("> ").strip()
         if not ans:
             continue
@@ -130,7 +128,6 @@ def select_snapshot_file() -> Optional[str]:
         Warn("No scan snapshots found.")
         return None
 
-    # sort by mtime descending (latest first)
     files_sorted = sorted(
         files,
         key=lambda f: os.path.getmtime(os.path.join(SCANS_DIR, f)),
@@ -156,23 +153,42 @@ def select_snapshot_file() -> Optional[str]:
                 }
             )
         except Exception:
-            # skip corrupt or incompatible files
             continue
 
     if not entries:
         Warn("No valid scan snapshots could be loaded.")
         return None
 
+    # Pretty table output for existing snapshots
     if RICH_AVAILABLE:
-        console.print("Available scan snapshots:", style="bold magenta")
+        table = Table(
+            title="Saved WinShield scan snapshots",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        table.add_column("ID", style="dim", width=4)
+        table.add_column("File")
+        table.add_column("System")
+        table.add_column("Date")
+        table.add_column("Missing KBs", justify="right")
+
+        for idx, e in enumerate(entries, start=1):
+            table.add_row(
+                str(idx),
+                e["file"],
+                e["system_tag"],
+                e["scan_date"],
+                str(e["missing"]),
+            )
+
+        console.print(table)
     else:
         print("Available scan snapshots:")
-
-    for idx, e in enumerate(entries, start=1):
-        print(
-            f"{idx}) {e['file']}  "
-            f"[system={e['system_tag']}, date={e['scan_date']}, missing={e['missing']}]"
-        )
+        for idx, e in enumerate(entries, start=1):
+            print(
+                f"{idx}) {e['file']}  "
+                f"[system={e['system_tag']}, date={e['scan_date']}, missing={e['missing']}]"
+            )
 
     while True:
         ans = input("Select snapshot by ID (or blank to cancel): ").strip()
@@ -191,17 +207,18 @@ def main() -> None:
     else:
         os.system("clear")
 
+    # Top banner
     if RICH_AVAILABLE:
-        console.print("=== WinShield Master Orchestrator ===", style="bold cyan")
+        console.print("========= WinShield =========", style="bold cyan")
     else:
-        print("=== WinShield Master Orchestrator ===")
+        print("========= WinShield =========")
     print()
 
     # 1) Auto run Controller
     if not os.path.isfile(CONTROLLER_PATH):
         Fail(f"Controller not found: {CONTROLLER_PATH}")
 
-    Info("Running environment controller...")
+    Info("Running WinShield Controller...")
     rc = run_python_script(CONTROLLER_PATH)
     if rc != 0:
         Warn(f"Controller exited with code {rc} (see above for details).")
@@ -223,14 +240,14 @@ def main() -> None:
         Fail("Cannot proceed further.")
 
     Good("Controller reports environment is ready.")
+    print()
 
     # 2) Choose scan source
-    print()
     choice = Ask_Choice(
-        "Select scan mode:",
+        "",
         [
-            "Run new scan now",
-            "Use existing scan snapshot",
+            "Run Scan",
+            "Existing Snapshot",
             "Exit",
         ],
     )
@@ -241,7 +258,6 @@ def main() -> None:
         Fail("User exited.")
 
     if choice == 1:
-        # Run new scanner
         if not os.path.isfile(SCANNER_PATH):
             Fail(f"Scanner file missing: {SCANNER_PATH}")
 

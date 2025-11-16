@@ -118,7 +118,7 @@ $props | ConvertTo-Json -Depth 2
             bitness = str(data.get("OSArchitecture", "")).strip()
             if not bitness:
                 bitness = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-            Good(f"Detected: {os_name} ({os_version}) Build {build} [{bitness}]")
+            Good(f"OS: {os_name} ({os_version}) Build {build} [{bitness}]")
             return os_name, os_version, build, bitness
         except Exception as exc:
             Warn(f"PowerShell OS JSON parse failed: {exc!r}")
@@ -128,7 +128,7 @@ $props | ConvertTo-Json -Depth 2
     os_version = platform.version()
     build = ""
     bitness = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-    Good(f"Detected: {os_name} ({os_version}) Build {build} [{bitness}]")
+    Good(f"OS: {os_name} ({os_version}) Build {build} [{bitness}]")
     return os_name, os_version, build, bitness
 
 
@@ -138,7 +138,7 @@ def detect_powershell_version() -> int:
     if rc == 0 and out_text.strip():
         try:
             version = int(out_text.strip().splitlines()[-1])
-            Good(f"PowerShell version: {version}")
+            Good(f"PowerShell: {version}")
             return version
         except Exception:
             Warn("Could not parse PowerShell version, defaulting to 0.")
@@ -154,6 +154,9 @@ def ensure_python_dependencies(errors: List[str]) -> bool:
         ("python-dateutil", "dateutil"),
     ]
     deps_ok = True
+    python_version = sys.version.split()[0]
+    Good(f"Python: {python_version}")
+
     for pip_name, import_name in modules:
         try:
             __import__(import_name)
@@ -191,8 +194,7 @@ def main() -> None:
     os_name, os_version, build, bitness = detect_os()
     ps_version = detect_powershell_version()
 
-    python_ok = True
-    Good("Python status: OK")
+    python_ok = True  # we are in Python already
 
     Info("Checking Python modules...")
     deps_ok = ensure_python_dependencies(errors)
