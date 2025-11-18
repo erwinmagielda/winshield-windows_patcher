@@ -1,36 +1,28 @@
 # WinShield_Manager.py
 """
-WinShield Manager
+WinShield Manager (Download only mode)
 
 - Takes a WinShield scan snapshot JSON (from WinShield_Scanner.py)
 - Lets the user:
     1) Show KBs
-    2) Install ALL missing KBs
-    3) Install KBs by ID (using the table ID column from the snapshot)
+    2) Download ALL missing KBs (no install)
+    3) Download KBs by ID (no install)
     4) Verify snapshot (run fresh scan and compare)
     5) Exit
 
-Verification:
-  - Uses the current snapshot as BASELINE.
-  - Runs WinShield_Scanner.py again (fresh scan).
-  - Loads the new snapshot.
-  - Compares baseline vs fresh by KB ID.
-  - Prints a table with:
-        ID | KB | Old Status | New Status | Verification
-    where Verification ∈ {No Change, Now Installed, Now Missing,
-                          Newly Installed, Newly Missing}.
-  - The active snapshot for Manager is NOT changed, so IDs remain
-    consistent with the baseline for this session.
-
-Installation:
-  - Uses the update GUID stored in snapshot["kb_details"][...]["update_id"].
-  - Calls Microsoft Update Catalog DownloadDialog.aspx to resolve the
-    download.windowsupdate.com URLs.
-  - Downloads the MSU/CAB file into ./downloads.
-  - Installs via wusa.exe <file> /quiet /norestart.
-
-Note:
-  - Run in an elevated shell (admin) if you actually want installs to work.
+Download:
+  - For each selected KB:
+        * Query Microsoft Update Catalog: Search.aspx?q=KB<id>
+        * Choose the row that best matches current OS (Windows 11 24H2 x64 etc.)
+        * Extract GUID candidates from that row/page (36 char UUIDs)
+        * For each GUID, POST a proper "updateIDs" JSON body to DownloadDialog.aspx
+        * From that dialog, collect URLs from downloadInformation[x].files[y].url
+        * Choose the best URL:
+              - Prefer URLs containing "kb<id>"
+              - Prefer URLs matching arch (x64/x86)
+              - Prefer .msu over .cab if both exist
+        * Download into ./downloads as KB<id>_<filename>
+  - No wusa/dism install is performed in this mode.
 """
 
 import json
@@ -160,177 +152,347 @@ def parse_id_list(text: str, max_id: int) -> List[int]:
 
 
 # --------------------------------------------------------------
-# Catalog download URL resolution
+# Catalog resolution
 # --------------------------------------------------------------
 
-def get_download_urls_from_update_id(update_id: str) -> List[str]:
+def http_get(url: str, params: Dict[str, str] | None = None, timeout: int = 30) -> Optional[requests.Response]:
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        return resp
+    except Exception as exc:
+        Warn(f"HTTP GET failed for {url}: {exc!r}")
+        return None
+
+
+def http_post_form(url: str, form_data: Dict[str, str], timeout: int = 30) -> Optional[requests.Response]:
     """
-    Given an update GUID, call DownloadDialog.aspx and return all
-    download.windowsupdate.com URLs found in the dialog.
+    HTTP POST with form data.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        resp = requests.post(url, data=form_data, headers=headers, timeout=timeout)
+        return resp
+    except Exception as exc:
+        Warn(f"HTTP POST failed for {url}: {exc!r}")
+        return None
+
+
+def derive_product_hints(os_name: str, build: str, bitness: str) -> Tuple[str, str, str]:
+    """
+    Derive base OS name, version label and arch hint for matching Catalog rows.
+    """
+    base = "Windows"
+    name = os_name or ""
+
+    if "Windows 11" in name:
+        base = "Windows 11"
+    elif "Windows 10" in name:
+        base = "Windows 10"
+    else:
+        base = name or "Windows"
+
+    version = ""
+    try:
+        b = int(str(build))
+    except Exception:
+        b = 0
+
+    if "Windows 11" in base:
+        if b >= 26100:
+            version = "Version 24H2"
+        else:
+            version = "Version 23H2"
+    elif "Windows 10" in base:
+        if b >= 19045:
+            version = "Version 22H2"
+
+    arch = "x64-based Systems" if "64" in bitness else "x86-based Systems"
+    return base, version, arch
+
+
+def choose_catalog_row_for_kb(kb: str, html: str, os_name: str, build: str, bitness: str) -> Optional[str]:
+    """
+    Given the HTML of Search.aspx?q=KB<id>, choose the <tr> block that best matches
+    the current OS (base + version + arch).
+    Returns the HTML of that row (as a string) or None.
+    """
+    base, version, arch = derive_product_hints(os_name, build, bitness)
+    Info(f"KB{kb}: Looking for OS hints: {base}, {version}, {arch}")
+
+    rows = re.split(r"(?i)<tr[^>]*>", html)
+    candidate_rows: List[str] = []
+    for row in rows:
+        if f"KB{kb}" not in row:
+            continue
+        candidate_rows.append(row)
+
+    if not candidate_rows:
+        Info(f"KB{kb}: No table rows containing KB{kb} found")
+        return None
+
+    Info(f"KB{kb}: Found {len(candidate_rows)} candidate rows containing KB{kb}")
+
+    def score(row: str) -> int:
+        s = 0
+        rl = row.lower()
+        if base.lower() in rl:
+            s += 2
+        if version and version.lower() in rl:
+            s += 2
+        if arch.lower() in rl:
+            s += 2
+        if "server" in rl:
+            s -= 2
+        return s
+
+    scored_rows = [(score(row), i, row) for i, row in enumerate(candidate_rows)]
+    scored_rows.sort(reverse=True, key=lambda x: x[0])
+
+    best_score, best_idx, best_row = scored_rows[0]
+    Info(f"KB{kb}: Selected row {best_idx+1}/{len(candidate_rows)} with score {best_score}")
+
+    best_lower = best_row.lower()
+    found_hints = []
+    if base.lower() in best_lower:
+        found_hints.append(base)
+    if version and version.lower() in best_lower:
+        found_hints.append(version)
+    if arch.lower() in best_lower:
+        found_hints.append(arch)
+    if "server" in best_lower:
+        found_hints.append("Server (penalty)")
+
+    Info(f"KB{kb}: Row contains: {', '.join(found_hints) if found_hints else 'no OS hints'}")
+
+    return best_row
+
+
+def extract_guids(text: str) -> List[str]:
+    """
+    Extract GUIDs from Download button IDs and other GUID like strings.
+    Prioritizes Download button IDs as they are the correct UpdateIDs.
+    """
+    download_button_guids = re.findall(
+        r'<input[^>]+id="([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"[^>]*class="[^"]*flatBlueButtonDownload[^"]*"',
+        text,
+        re.IGNORECASE
+    )
+
+    if not download_button_guids:
+        download_button_guids = re.findall(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            text,
+        )
+
+    seen = set()
+    result: List[str] = []
+    for g in download_button_guids:
+        if g not in seen:
+            seen.add(g)
+            result.append(g)
+    return result
+
+
+def post_download_dialog_for_guid(guid: str) -> Optional[requests.Response]:
+    """
+    Use the Catalog API pattern:
+
+      POST https://www.catalog.update.microsoft.com/DownloadDialog.aspx
+      Body: updateIDs = "[{\"size\":0,\"updateID\":\"GUID\",\"uidInfo\":\"GUID\"}]"
     """
     base_url = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
-    headers = {"User-Agent": USER_AGENT}
+    post_obj = {"size": 0, "updateID": guid, "uidInfo": guid}
+    body = {"updateIDs": f"[{json.dumps(post_obj, separators=(',', ':'))}]"}
+    return http_post_form(base_url, body)
 
-    html = None
-    for params in ({"updateid": update_id}, {"id": update_id}):
-        try:
-            resp = requests.get(
-                base_url,
-                params=params,
-                headers=headers,
-                timeout=30,
-            )
-            if resp.status_code == 200 and "Download" in resp.text:
-                html = resp.text
-                break
-        except Exception:
+
+def resolve_dialog_for_kb(kb: str, search_html: str, os_name: str, build: str, bitness: str) -> Optional[str]:
+    """
+    From Search.aspx?q=KB<id> HTML, choose the correct row, then try GUIDs
+    from that row (and as fallback from entire page) against DownloadDialog.aspx
+    using the updateIDs POST trick, until one returns a dialog that has
+    downloadInformation[...] entries.
+    """
+    row = choose_catalog_row_for_kb(kb, search_html, os_name, build, bitness)
+    guid_candidates = extract_guids(row or "")
+    if not guid_candidates:
+        guid_candidates = extract_guids(search_html)
+        Info(f"KB{kb}: Using fallback - found {len(guid_candidates)} GUIDs from entire page")
+
+    if not guid_candidates:
+        Warn(f"KB{kb}: no GUIDs found on Catalog page.")
+        return None
+
+    Info(f"KB{kb}: Trying {len(guid_candidates)} GUID candidates for download dialog...")
+    if len(guid_candidates) <= 5:
+        Info(f"KB{kb}: GUID candidates: {', '.join(guid_candidates)}")
+
+    for i, guid in enumerate(guid_candidates, 1):
+        Info(f"KB{kb}: Attempting GUID {i}/{len(guid_candidates)}: {guid}")
+
+        resp = post_download_dialog_for_guid(guid)
+        if not resp:
+            Info(f"KB{kb}: No POST response for GUID {guid}")
+            continue
+        if resp.status_code != 200:
+            Info(f"KB{kb}: POST HTTP {resp.status_code} for GUID {guid}")
             continue
 
-    if not html:
-        return []
+        html = resp.text
 
-    urls = re.findall(
-        r'href="(https?://download\.windowsupdate\.com/[^"]+)"',
-        html,
-        re.IGNORECASE,
-    )
-    urls = sorted(set(urls))
-    return urls
+        if not re.search(r"downloadInformation\[\d+\]\.files\[\d+\]\.url\s*=", html):
+            Info(f"KB{kb}: GUID {guid} POST response has no downloadInformation[] entries")
+            continue
+
+        kb_in_text = f"KB{kb}" in html
+        kb_in_filename = bool(re.search(rf'kb{kb}[_-]', html, re.IGNORECASE))
+
+        Info(
+            f"KB{kb}: GUID {guid} POST response seems valid, "
+            f"KB in text: {kb_in_text}, KB in filename: {kb_in_filename}"
+        )
+
+        return html
+
+    Warn(f"KB{kb}: no valid DownloadDialog.aspx response found for GUID candidates.")
+    return None
 
 
-def choose_best_download_url(urls: List[str]) -> Optional[str]:
+def choose_file_from_dialog(kb: str, dialog_html: str, bitness: str) -> Optional[str]:
     """
-    Prefer .msu, then .cab, otherwise first URL.
+    From DownloadDialog.aspx HTML, pick the best URL for this KB.
+    Source:
+      downloadInformation[x].files[y].url = 'https://...cab or .msu'
+    Preference:
+      - URLs containing "kb<id>"
+      - URLs matching target arch (x64/x86)
+      - .msu over .cab
     """
+    js_pattern = r"downloadInformation\[\d+\]\.files\[\d+\]\.url\s*=\s*'([^']+)'"
+    urls = re.findall(js_pattern, dialog_html)
+
     if not urls:
+        href_urls = re.findall(
+            r'href="(https?://[^"]+\.(?:cab|msu))"',
+            dialog_html,
+            re.IGNORECASE,
+        )
+        extra_urls = re.findall(
+            r'(https?://[^\s"\'>]+\.(?:cab|msu))',
+            dialog_html,
+            re.IGNORECASE,
+        )
+        urls = list(set(href_urls + extra_urls))
+
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        Info(f"KB{kb}: Dialog contained no .cab/.msu URLs")
         return None
-    msu = [u for u in urls if u.lower().endswith(".msu")]
-    if msu:
-        return msu[0]
-    cab = [u for u in urls if u.lower().endswith(".cab")]
-    if cab:
-        return cab[0]
-    return urls[0]
+
+    Info(f"KB{kb}: Found {len(urls)} potential download URLs in dialog")
+
+    kb_lower = f"kb{kb}".lower()
+    arch_token = "x64" if "64" in bitness else "x86"
+
+    def classify(u: str) -> Tuple[int, int, int]:
+        u_lower = u.lower()
+        score_kb = 1 if kb_lower in u_lower else 0
+        score_arch = 1 if arch_token in u_lower else 0
+        score_ext = 2 if u_lower.endswith(".msu") else 1
+        return (score_kb, score_arch, score_ext)
+
+    best_url = max(urls, key=classify)
+    Info(f"KB{kb}: Selected URL: {best_url}")
+    return best_url
+
+
+def resolve_download_for_kb(kb: str, os_name: str, build: str, bitness: str) -> Optional[str]:
+    """
+    High level helper: given KB and system info, return a single URL for the
+    .cab/.msu file that should apply to this system, or None.
+    """
+    search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
+    resp = http_get(search_url, params={"q": f"KB{kb}"}, timeout=30)
+    if not resp or resp.status_code != 200:
+        Warn(f"KB{kb}: Catalog search failed.")
+        return None
+
+    dialog_html = resolve_dialog_for_kb(kb, resp.text, os_name, build, bitness)
+    if not dialog_html:
+        return None
+
+    file_url = choose_file_from_dialog(kb, dialog_html, bitness)
+    if not file_url:
+        Warn(f"KB{kb}: could not find any .cab/.msu URLs in download dialog.")
+        return None
+
+    return file_url
 
 
 # --------------------------------------------------------------
-# Download & install
+# Download (no install)
 # --------------------------------------------------------------
 
-def download_file(url: str, dest_path: str) -> bool:
+def download_file(url: str, dest_path: str) -> Optional[int]:
     """
     Download a file from URL to dest_path.
-    Simple streaming download, no per-byte progress (we tick per KB).
+    Returns file size in bytes, or None on error.
     """
     headers = {"User-Agent": USER_AGENT}
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        with requests.get(url, headers=headers, stream=True, timeout=120) as r:
             r.raise_for_status()
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            total_bytes = 0
             with open(dest_path, "wb") as fh:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         fh.write(chunk)
-        return True
+                        total_bytes += len(chunk)
+        return total_bytes
     except Exception as exc:
         Warn(f"Download failed for {url}: {exc!r}")
-        return False
+        return None
 
 
-def run_wusa_install(path: str) -> int:
-    """
-    Run wusa.exe <path> /quiet /norestart
-    Returns the exit code from wusa.
-    """
-    cmd = ["wusa.exe", path, "/quiet", "/norestart"]
-    try:
-        proc = subprocess.run(cmd)
-        return proc.returncode
-    except Exception as exc:
-        Warn(f"Failed to launch wusa for {path}: {exc!r}")
-        return -1
-
-
-def install_kbs(kb_entries: List[Dict[str, Any]]) -> None:
-    """
-    Given a list of kb_details entries (all 'Missing'), download & install them.
-    Uses two progress bars: one for downloads, one for installs.
-    """
+def download_kbs(kb_entries, os_name, build, bitness):
     if not kb_entries:
-        Warn("No KBs selected for installation.")
+        Warn("No KBs selected for download.")
         return
 
-    # Resolve download URLs first (so we can bail early if GUID missing)
-    resolved: List[Tuple[Dict[str, Any], str]] = []  # (entry, url)
+    Good(f"Preparing to download {len(kb_entries)} KB package(s)...")
+
     for entry in kb_entries:
         kb = entry["kb"]
-        update_id = entry.get("update_id")
-        if not update_id:
-            Warn(f"KB{kb}: no update GUID in snapshot, cannot auto-download.")
-            continue
-
-        urls = get_download_urls_from_update_id(update_id)
-        url = choose_best_download_url(urls)
+        Info(f"Resolving download URL for KB{kb}...")
+        url = resolve_download_for_kb(kb, os_name, build, bitness)
         if not url:
-            Warn(f"KB{kb}: could not resolve download URL from Catalog.")
+            Warn(f"KB{kb}: could not resolve download URL.")
             continue
-        resolved.append((entry, url))
 
-    if not resolved:
-        Warn("No KBs had resolvable download URLs; nothing to install.")
-        return
+        filename = os.path.basename(url.split("?")[0])
+        local_path = os.path.join(DOWNLOADS_DIR, f"KB{kb}_{filename}")
 
-    # Download phase
-    Good(f"Preparing to download {len(resolved)} KB package(s)...")
-    downloads: List[Tuple[Dict[str, Any], str]] = []  # (entry, local_path)
-
-    with Progress() as progress:
-        task_dl = progress.add_task(
-            "[cyan]Downloading KB packages...",
-            total=len(resolved),
-        )
-        for entry, url in resolved:
-            kb = entry["kb"]
-            filename = os.path.basename(url.split("?")[0])
-            local_path = os.path.join(DOWNLOADS_DIR, f"KB{kb}_{filename}")
-
-            progress.console.print(f"[*] KB{kb}: {filename}")
-            ok = download_file(url, local_path)
-            if ok:
-                downloads.append((entry, local_path))
-            progress.advance(task_dl)
-
-    if not downloads:
-        Warn("All downloads failed; cannot install anything.")
-        return
-
-    # Install phase
-    Good(f"Starting installation of {len(downloads)} KB package(s)...")
-    results: List[Tuple[str, int]] = []  # (kb, exit_code)
-
-    with Progress() as progress:
-        task_inst = progress.add_task(
-            "[cyan]Installing KB packages (wusa)...",
-            total=len(downloads),
-        )
-        for entry, local_path in downloads:
-            kb = entry["kb"]
-            progress.console.print(f"[*] Installing KB{kb}...")
-            exit_code = run_wusa_install(local_path)
-            results.append((kb, exit_code))
-            progress.advance(task_inst)
-
-    # Summary
-    Good("Installation summary:")
-    for kb, code in results:
-        if code == 0:
-            console.print(f"  KB{kb}: [bold green]SUCCESS[/bold green] (wusa=0)")
+        Info(f"KB{kb}: {filename}")
+        size_bytes = download_file(url, local_path)
+        if size_bytes is not None:
+            size_mb = size_bytes / (1024 * 1024)
+            Good(f"KB{kb}: downloaded to {local_path} ({size_mb:.1f} MB)")
         else:
-            console.print(
-                f"  KB{kb}: [bold red]FAILED[/bold red] (wusa={code}) "
-                "[dim](may be superseded or not applicable)[/dim]"
-            )
+            Warn(f"KB{kb}: download failed.")
 
+    Good("Download only operation complete. No installation was performed.")
 
 # --------------------------------------------------------------
 # Verification / comparison
@@ -338,7 +500,7 @@ def install_kbs(kb_entries: List[Dict[str, Any]]) -> None:
 
 def build_kb_index(kb_details: List[Dict[str, Any]]) -> Dict[str, int]:
     """
-    Build mapping: kb_id (string) -> baseline ID (1-based index).
+    Build mapping: kb_id (string) -> baseline ID (1 based index).
     """
     index: Dict[str, int] = {}
     for idx, d in enumerate(kb_details, start=1):
@@ -390,7 +552,6 @@ def compare_snapshots(baseline: Dict[str, Any], fresh: Dict[str, Any]) -> None:
         old_status = (base_entry or {}).get("status", "N/A")
         new_status = (fresh_entry or {}).get("status", "N/A")
 
-        # Determine verification label
         if old_status == new_status:
             verification = "No Change"
         elif old_status == "Missing" and new_status == "Installed":
@@ -404,7 +565,6 @@ def compare_snapshots(baseline: Dict[str, Any], fresh: Dict[str, Any]) -> None:
         else:
             verification = "Status changed"
 
-        # ID comes from baseline index if present, otherwise "-"
         kb_id = base_index.get(kb)
         id_str = str(kb_id) if kb_id is not None else "-"
 
@@ -483,8 +643,11 @@ def main() -> None:
     system_tag = snapshot.get("system_tag", "unknown")
     scan_date = snapshot.get("scan_date", "unknown")
 
-    # No screen clear on purpose – we want scrollback for accountability.
-    console.print("========= WinShield Manager =========", style="bold cyan")
+    os_name = snapshot.get("os_name", "Unknown Windows")
+    build = snapshot.get("build", "Unknown")
+    bitness = snapshot.get("bitness", "Unknown")
+
+    console.print("========= WinShield Manager (Download only) =========", style="bold cyan")
     console.print(
         f"[dim]Baseline snapshot:[/dim] {os.path.basename(snapshot_path)}  "
         f"[dim]System:[/dim] {system_tag}  [dim]Date:[/dim] {scan_date}\n"
@@ -492,8 +655,8 @@ def main() -> None:
 
     while True:
         console.print("1) Show KBs")
-        console.print("2) Install ALL missing KBs")
-        console.print("3) Install KBs by ID")
+        console.print("2) Download ALL missing KBs (no install)")
+        console.print("3) Download KBs by ID (no install)")
         console.print("4) Verify snapshot (fresh scan & compare)")
         console.print("5) Exit")
         choice = input("> ").strip()
@@ -507,13 +670,13 @@ def main() -> None:
             if not missing:
                 Good("There are no missing KBs in this snapshot.")
             else:
-                install_kbs(missing)
+                download_kbs(missing, os_name, build, bitness)
             continue
 
         if choice == "3":
             max_id = len(kb_details)
             ids_text = input(
-                f"Enter ID(s) to install (1-{max_id}, e.g. '1 3 5' or '2-4'): "
+                f"Enter ID(s) to download (1-{max_id}, e.g. '1 3 5' or '2-4'): "
             ).strip()
             if not ids_text:
                 continue
@@ -532,9 +695,9 @@ def main() -> None:
                 selected.append(entry)
 
             if not selected:
-                Warn("No Missing KBs selected, nothing to install.")
+                Warn("No Missing KBs selected, nothing to download.")
             else:
-                install_kbs(selected)
+                download_kbs(selected, os_name, build, bitness)
             continue
 
         if choice == "4":
@@ -542,7 +705,7 @@ def main() -> None:
             continue
 
         if choice == "5":
-            Good("Exiting WinShield Manager.")
+            Good("Exiting WinShield Manager (download only mode).")
             break
 
         Warn("Please choose a valid option (1-5).")
