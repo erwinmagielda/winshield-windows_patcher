@@ -76,7 +76,6 @@ def generate_month_ids(num_months=1):
 
     return ordered
 
-
 def main():
     print("[*] Running baseline script...")
     baseline = run_powershell_script(BASELINE_SCRIPT)
@@ -96,7 +95,7 @@ def main():
     print(f"[+] Installed KBs ({len(installed_kbs)}): {', '.join(sorted(installed_kbs))}")
     print()
 
-    # For now, look at last 1 or 3 months of MSRC bulletins
+    # For now, look at last 1 month of MSRC bulletins
     month_ids = generate_month_ids(num_months=1)
     print(f"[*] Querying MSRC for months: {', '.join(month_ids)}")
 
@@ -108,10 +107,32 @@ def main():
         print("[-] MSRC adapter returned no KB entries. Nothing to compare.")
         sys.exit(0)
 
-    # Build sets
+    # --- build supersedence map: KB -> set of KBs it supersedes ---
+    supersedes_map: dict[str, set[str]] = {}
+    for entry in kb_entries:
+        kb = entry.get("KB")
+        if not kb:
+            continue
+        for sup in (entry.get("Supersedes") or []):
+            supersedes_map.setdefault(kb, set()).add(sup)
+
+    # --- build sets ---
     expected_kbs = {entry["KB"] for entry in kb_entries if "KB" in entry}
-    present_kbs = sorted(expected_kbs & installed_kbs)
-    missing_kbs = sorted(expected_kbs - installed_kbs)
+
+    # Logical presence: installed KBs + any KBs they supersede (transitively)
+    logical_present = set(installed_kbs)
+
+    changed = True
+    while changed:
+        changed = False
+        for kb in list(logical_present):
+            for superseded in supersedes_map.get(kb, set()):
+                if superseded not in logical_present:
+                    logical_present.add(superseded)
+                    changed = True
+
+    present_kbs = sorted(expected_kbs & logical_present)
+    missing_kbs = sorted(expected_kbs - logical_present)
 
     print()
     print("=== Summary ===")
@@ -142,7 +163,15 @@ def main():
         entry = kb_index.get(kb, {})
         months = ",".join(entry.get("Months") or [])
         cves = entry.get("Cves") or []
-        status = "Installed" if kb in installed_kbs else "Missing"
+
+        if kb in installed_kbs:
+            status = "Installed"
+        elif kb in logical_present:
+            # Not physically installed, but superseded by an installed CU
+            status = "Superseded"
+        else:
+            status = "Missing"
+
         cve_display = format_cve_list(cves, max_show=3)
         print(f"{kb:<10} {status:<10} {months:<15} {cve_display}")
 
@@ -156,10 +185,6 @@ def main():
             months = ",".join(entry.get("Months") or [])
             cves = entry.get("Cves") or []
             print(f"- {kb} (months: {months}, CVEs: {len(set(cves))})")
-
-    # This is the hook the downloader will use later
-    # For example:
-    # return missing_kbs
 
     # ------------------------------------------------------------------
     # Export machine-readable result for downloader / installer
@@ -178,7 +203,6 @@ def main():
 
     print()
     print(f"[+] Saved detailed scan result to {out_path}")
-
 
 if __name__ == "__main__":
     try:

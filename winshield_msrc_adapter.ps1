@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-WinShield MSRC adapter (multi month, CVEs from affected software rows)
+WinShield MSRC adapter (multi month, CVEs + supersedence)
 
 - Requires MsrcSecurityUpdates module (MSRC API client)
 - For given MonthIds and ProductNameHint, returns:
   - KBs for that product across those months
-  - per KB list of CVEs (taken directly from Get-MsrcCvrfAffectedSoftware rows)
+  - per KB list of CVEs (from affected software rows)
+  - per KB list of Supersedes (KBs this KB replaces)
 - Emits JSON for WinShield (Python) to consume
 #>
 
@@ -30,7 +31,7 @@ try {
     exit 1
 }
 
-# Map: KB -> object { KB, Months[], Cves[] }
+# Map: KB -> object { KB, Months[], Cves[], Supersedes[] }
 $kbMap = @{}
 
 foreach ($month in $MonthIds) {
@@ -40,10 +41,11 @@ foreach ($month in $MonthIds) {
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
     } catch {
         $kbMap["__ERROR__$month"] = [pscustomobject]@{
-            KB     = $null
-            Months = @($month)
-            Cves   = @()
-            Error  = "Failed to query MSRC for month ${month}: $($_.Exception.Message)"
+            KB         = $null
+            Months     = @($month)
+            Cves       = @()
+            Supersedes = @()
+            Error      = "Failed to query MSRC for month ${month}: $($_.Exception.Message)"
         }
         continue
     }
@@ -67,19 +69,32 @@ foreach ($month in $MonthIds) {
             }
         }
 
-        # For each KB in KBArticle, attach those CVEs
+        # Supersedence: values like {, 5066835, , ...}
+        $supersededCandidates = @()
+        if ($row.PSObject.Properties.Name -contains 'Supercedence' -and $row.Supercedence) {
+            foreach ($s in $row.Supercedence) {
+                if ($null -eq $s) { continue }
+                $sStr = [string]$s
+                if ($sStr -match '(\d{4,7})') {
+                    $supersededCandidates += ("KB" + $Matches[1])
+                }
+            }
+        }
+
+        # For each KB in KBArticle, attach CVEs and Supersedes
         if ($row.KBArticle) {
             foreach ($kbObj in $row.KBArticle) {
                 if (-not $kbObj.ID) { continue }
 
-                $kid   = $kbObj.ID
+                $kid    = $kbObj.ID
                 $kbNorm = if ($kid -like 'KB*') { $kid } else { "KB$kid" }
 
                 if (-not $kbMap.ContainsKey($kbNorm)) {
                     $kbMap[$kbNorm] = [pscustomobject]@{
-                        KB     = $kbNorm
-                        Months = @()
-                        Cves   = @()
+                        KB         = $kbNorm
+                        Months     = @()
+                        Cves       = @()
+                        Supersedes = @()
                     }
                 }
 
@@ -92,6 +107,13 @@ foreach ($month in $MonthIds) {
                 foreach ($c in $cveList) {
                     if ($c -and $kbMap[$kbNorm].Cves -notcontains $c) {
                         $kbMap[$kbNorm].Cves += $c
+                    }
+                }
+
+                # Supersedes (KBs this KB replaces)
+                foreach ($sup in $supersededCandidates) {
+                    if ($kbMap[$kbNorm].Supersedes -notcontains $sup) {
+                        $kbMap[$kbNorm].Supersedes += $sup
                     }
                 }
             }
