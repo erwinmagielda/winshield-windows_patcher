@@ -1,37 +1,23 @@
-
-# Python generates these cache folders automatically when running code
-# They're specific to each machine, so no point committing them
+# Python cache / temp
 __pycache__/
 *.pyc
+*.pyo
 
-# Scanner output file - gets regenerated every time I run the scanner
-# Each person will have different results based on their system
-# No need to commit my personal scan results
-scanner_results.json
-controller_results.json
-kb_metadata.json
+# PowerShell compiled artifacts
+*.ps1xml
 
-# Log files - useful for debugging but not part of the actual code
-# These get messy and change constantly, don't belong in version control
+# Local scan outputs
+winshield_scan_result.json
+
+# Downloaded KB packages
+downloads/
+
+# Logs
 *.log
 
-# VSCode creates this folder for editor settings
-# Everyone has different editor preferences, keep it local
+# IDE clutter
 .vscode/
-
-# PyCharm/IntelliJ IDEA settings folder
-# Same reason as above - personal IDE config
 .idea/
 
-# Windows creates this file for folder thumbnails
-# It's system junk, not part of the project
-Thumbs.db
-
-# Windows folder config file - also system junk
-desktop.ini
-
+# Personal notes
 notes.txt
-
-scans
-
-downloads
