@@ -1,19 +1,21 @@
 import json
+import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, UTC
 
-
-# Adjust these if your script names differ
+# PowerShell scripts
 BASELINE_SCRIPT = "WinShield_Baseline.ps1"
 INVENTORY_SCRIPT = "winshield_inventory.ps1"
 MSRC_ADAPTER_SCRIPT = "winshield_msrc_adapter.ps1"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def run_powershell_script(script_name, extra_args=None):
+
+def run_powershell_script(script_name: str, extra_args=None) -> dict:
     """
     Run a PowerShell script and return parsed JSON from stdout.
-    Raises RuntimeError on non zero exit or invalid JSON.
+    Raises RuntimeError on non-zero exit or invalid JSON.
     """
     if extra_args is None:
         extra_args = []
@@ -52,31 +54,31 @@ def run_powershell_script(script_name, extra_args=None):
         )
 
 
-def generate_month_ids(num_months=1):
+def generate_month_ids(num_months: int = 6) -> list[str]:
     """
-    Generate MSRC month IDs like '2025-Nov', going backwards from current month.
+    Generate MSRC MonthIds (YYYY-MMM) going backwards one real month at a time
+    from the current month: e.g. ['2025-Nov', '2025-Oct', ...].
     """
     now = datetime.now(UTC).replace(day=1)
-    month_ids = []
+    year = now.year
+    month = now.month
+    month_ids: list[str] = []
 
-    for i in range(num_months):
-        dt = now - timedelta(days=31 * i)
-        # Normalize back to first of month
-        dt = dt.replace(day=1)
-        month_id = dt.strftime("%Y-%b")  # example: 2025-Nov
-        month_ids.append(month_id)
+    for _ in range(num_months):
+        dt = datetime(year, month, 1, tzinfo=UTC)
+        month_ids.append(dt.strftime("%Y-%b"))
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
 
-    # Remove duplicates in case timedelta produced same month twice
-    seen = set()
-    ordered = []
-    for mid in month_ids:
-        if mid not in seen:
-            seen.add(mid)
-            ordered.append(mid)
+    return month_ids
 
-    return ordered
 
 def main():
+    # ------------------------------------------------------------------
+    # Baseline
+    # ------------------------------------------------------------------
     print("[*] Running baseline script...")
     baseline = run_powershell_script(BASELINE_SCRIPT)
     product_hint = baseline.get("ProductNameHint")
@@ -86,20 +88,30 @@ def main():
         sys.exit(1)
 
     print(f"[+] Product hint: {product_hint}")
-    print(f"[+] OS: {baseline.get('OSName')} {baseline.get('DisplayVersion')} ({baseline.get('FullBuild')})")
+    print(
+        f"[+] OS: {baseline.get('OSName')} "
+        f"{baseline.get('DisplayVersion')} "
+        f"({baseline.get('FullBuild')})"
+    )
     print()
 
+    # ------------------------------------------------------------------
+    # Inventory (installed KBs)
+    # ------------------------------------------------------------------
     print("[*] Running inventory script...")
     inventory = run_powershell_script(INVENTORY_SCRIPT)
     installed_kbs = set(inventory.get("AllInstalledKbs") or [])
     print(f"[+] Installed KBs ({len(installed_kbs)}): {', '.join(sorted(installed_kbs))}")
     print()
 
-    # For now, look at last 1 month of MSRC bulletins
-    month_ids = generate_month_ids(num_months=1)
+    # ------------------------------------------------------------------
+    # MSRC month range: last 6 months from now
+    # ------------------------------------------------------------------
+    month_ids = generate_month_ids(num_months=6)
     print(f"[*] Querying MSRC for months: {', '.join(month_ids)}")
 
-    extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]
+    month_ids_arg = ",".join(month_ids)
+    extra_args = ["-MonthIds", month_ids_arg, "-ProductNameHint", product_hint]
     msrc_data = run_powershell_script(MSRC_ADAPTER_SCRIPT, extra_args=extra_args)
 
     kb_entries = msrc_data.get("KbEntries") or []
@@ -107,7 +119,9 @@ def main():
         print("[-] MSRC adapter returned no KB entries. Nothing to compare.")
         sys.exit(0)
 
-    # --- build supersedence map: KB -> set of KBs it supersedes ---
+    # ------------------------------------------------------------------
+    # Supersedence map: KB -> set of KBs it supersedes
+    # ------------------------------------------------------------------
     supersedes_map: dict[str, set[str]] = {}
     for entry in kb_entries:
         kb = entry.get("KB")
@@ -116,10 +130,9 @@ def main():
         for sup in (entry.get("Supersedes") or []):
             supersedes_map.setdefault(kb, set()).add(sup)
 
-    # --- build sets ---
     expected_kbs = {entry["KB"] for entry in kb_entries if "KB" in entry}
 
-    # Logical presence: installed KBs + any KBs they supersede (transitively)
+    # logical_present = installed KBs + anything they supersede (transitively)
     logical_present = set(installed_kbs)
 
     changed = True
@@ -134,27 +147,27 @@ def main():
     present_kbs = sorted(expected_kbs & logical_present)
     missing_kbs = sorted(expected_kbs - logical_present)
 
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
     print()
     print("=== Summary ===")
     print(f"Total expected KBs from MSRC for {product_hint}: {len(expected_kbs)}")
     print(f"Installed (from that set): {len(present_kbs)}")
-    print(f"Missing (from that set):   {len(missing_kbs)}")
+    print(f"Missing   (from that set): {len(missing_kbs)}")
     print()
 
-    # Build easy lookup for KB -> entry data
     kb_index = {entry["KB"]: entry for entry in kb_entries if "KB" in entry}
 
-    def format_cve_list(cves, max_show=5):
+    def format_cve_list(cves, max_show=5) -> str:
         if not cves:
             return "0"
         cves = sorted(set(cves))
         if len(cves) <= max_show:
             return f"{len(cves)} ({', '.join(cves)})"
-        else:
-            head = ", ".join(cves[:max_show])
-            return f"{len(cves)} ({head}, ...)"
+        head = ", ".join(cves[:max_show])
+        return f"{len(cves)} ({head}, ...)"
 
-    # Pretty print table
     print("=== KB status (per MSRC, for these months) ===")
     print(f"{'KB':<10} {'Status':<10} {'Months':<15} {'CVEs'}")
     print("-" * 80)
@@ -167,13 +180,24 @@ def main():
         if kb in installed_kbs:
             status = "Installed"
         elif kb in logical_present:
-            # Not physically installed, but superseded by an installed CU
             status = "Superseded"
         else:
             status = "Missing"
 
         cve_display = format_cve_list(cves, max_show=3)
         print(f"{kb:<10} {status:<10} {months:<15} {cve_display}")
+
+    # ------------------------------------------------------------------
+    # Catalog availability from downloader (Downloadable / Unavailable)
+    # ------------------------------------------------------------------
+    catalog_status: dict[str, str] = {}
+    status_path = os.path.join(SCRIPT_DIR, "winshield_catalog_status.json")
+    if os.path.isfile(status_path):
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                catalog_status = json.load(f)
+        except Exception:
+            catalog_status = {}
 
     print()
     print("=== Missing KBs that WinShield could download/patch next ===")
@@ -184,7 +208,12 @@ def main():
             entry = kb_index.get(kb, {})
             months = ",".join(entry.get("Months") or [])
             cves = entry.get("Cves") or []
-            print(f"- {kb} (months: {months}, CVEs: {len(set(cves))})")
+            cat = catalog_status.get(kb)
+            catalog_word = cat if cat in ("Downloadable", "Unavailable") else "Unknown"
+            print(
+                f"- {kb} (months: {months}, CVEs: {len(set(cves))}, "
+                f"Catalog: {catalog_word})"
+            )
 
     # ------------------------------------------------------------------
     # Export machine-readable result for downloader / installer
@@ -197,12 +226,13 @@ def main():
         "missing_kbs": missing_kbs,
     }
 
-    out_path = "winshield_scan_result.json"
+    out_path = os.path.join(SCRIPT_DIR, "winshield_scan_result.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
     print()
     print(f"[+] Saved detailed scan result to {out_path}")
+
 
 if __name__ == "__main__":
     try:

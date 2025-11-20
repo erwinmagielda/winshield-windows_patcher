@@ -1,24 +1,54 @@
 <#
 .SYNOPSIS
-WinShield MSRC adapter (multi month, CVEs + supersedence)
+    WinShield MSRC adapter (multi month, CVEs + supersedence)
 
-- Requires MsrcSecurityUpdates module (MSRC API client)
-- For given MonthIds and ProductNameHint, returns:
-  - KBs for that product across those months
-  - per KB list of CVEs (from affected software rows)
-  - per KB list of Supersedes (KBs this KB replaces)
-- Emits JSON for WinShield (Python) to consume
+.DESCRIPTION
+    - Requires MsrcSecurityUpdates module (MSRC API client)
+    - For given MonthIds and ProductNameHint, returns:
+        * KBs for that product across those months
+        * per-KB list of CVEs (from affected software rows)
+        * per-KB list of Supersedes (KBs this KB replaces)
+    - Emits JSON for WinShield (Python) to consume
+
+.PARAMETER MonthIds
+    Can be passed as:
+        -MonthIds 2025-Nov 2025-Oct 2025-Sep
+    or
+        -MonthIds "2025-Nov,2025-Oct,2025-Sep"
+
+.PARAMETER ProductNameHint
+    MSRC product name, e.g. "Windows 11 Version 25H2 for x64-based Systems".
 #>
 
 param(
     [Parameter(Mandatory = $true)]
-    [string[]]$MonthIds,        # e.g. '2025-Nov','2025-Oct'
+    [string[]]$MonthIds,
 
     [Parameter(Mandatory = $true)]
-    [string]$ProductNameHint    # e.g. 'Windows 11 Version 25H2 for x64-based Systems'
+    [string]$ProductNameHint
 )
 
-# --- Load MSRC module ---
+# -------------------------------------------------------------------
+# Normalize MonthIds (support array + comma-separated)
+# -------------------------------------------------------------------
+$flatMonths = @()
+
+foreach ($m in $MonthIds) {
+    if ($null -eq $m) { continue }
+    # If someone passed "2025-Nov,2025-Oct", split on comma
+    $parts = $m -split '\s*,\s*'
+    foreach ($p in $parts) {
+        if ($p -and $p.Trim() -ne "") {
+            $flatMonths += $p.Trim()
+        }
+    }
+}
+
+$MonthIds = $flatMonths | Select-Object -Unique
+
+# -------------------------------------------------------------------
+# Load MSRC module
+# -------------------------------------------------------------------
 try {
     Import-Module -Name MsrcSecurityUpdates -ErrorAction Stop
 } catch {
@@ -35,11 +65,13 @@ try {
 $kbMap = @{}
 
 foreach ($month in $MonthIds) {
+    if (-not $month) { continue }
 
     try {
         $doc = Get-MsrcCvrfDocument -ID $month -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
     } catch {
+        # Store the error for this month but continue with others
         $kbMap["__ERROR__$month"] = [pscustomobject]@{
             KB         = $null
             Months     = @($month)
@@ -59,7 +91,7 @@ foreach ($month in $MonthIds) {
 
     foreach ($row in $rows) {
 
-        # Normalise CVE to an array
+        # --- CVEs ---------------------------------------------------
         $cveList = @()
         if ($row.CVE) {
             if ($row.CVE -is [System.Collections.IEnumerable] -and -not ($row.CVE -is [string])) {
@@ -69,7 +101,7 @@ foreach ($month in $MonthIds) {
             }
         }
 
-        # Supersedence: values like {, 5066835, , ...}
+        # --- Supersedence: values like {, 5066835, , ...} ----------
         $supersededCandidates = @()
         if ($row.PSObject.Properties.Name -contains 'Supercedence' -and $row.Supercedence) {
             foreach ($s in $row.Supercedence) {
@@ -81,7 +113,7 @@ foreach ($month in $MonthIds) {
             }
         }
 
-        # For each KB in KBArticle, attach CVEs and Supersedes
+        # --- Per KB in KBArticle -----------------------------------
         if ($row.KBArticle) {
             foreach ($kbObj in $row.KBArticle) {
                 if (-not $kbObj.ID) { continue }
@@ -98,7 +130,7 @@ foreach ($month in $MonthIds) {
                     }
                 }
 
-                # Month
+                # Month membership
                 if ($kbMap[$kbNorm].Months -notcontains $month) {
                     $kbMap[$kbNorm].Months += $month
                 }
@@ -121,7 +153,9 @@ foreach ($month in $MonthIds) {
     }
 }
 
-# Build final list
+# -------------------------------------------------------------------
+# Build final list and output JSON
+# -------------------------------------------------------------------
 $kbList = $kbMap.GetEnumerator() |
     Where-Object { $_.Key -notlike '__ERROR__*' } |
     ForEach-Object { $_.Value } |
