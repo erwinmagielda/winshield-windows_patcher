@@ -8,6 +8,7 @@ __pycache__/
 
 # Local scan outputs
 winshield_scan_result.json
+winshiedl_catalog_status.json
 
 # Downloaded KB packages
 downloads/
