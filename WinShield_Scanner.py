@@ -4,8 +4,8 @@ import subprocess
 import sys
 from datetime import datetime, UTC
 
-# PowerShell scripts
-BASELINE_SCRIPT = "WinShield_Baseline.ps1"
+# PowerShell scripts – USE EXACT FILENAMES YOU ACTUALLY RUN
+BASELINE_SCRIPT = "winshield_baseline.ps1"
 INVENTORY_SCRIPT = "winshield_inventory.ps1"
 MSRC_ADAPTER_SCRIPT = "winshield_msrc_adapter.ps1"
 
@@ -14,11 +14,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def run_powershell_script(script_name: str, extra_args=None) -> dict:
     """
-    Run a PowerShell script and return parsed JSON from stdout.
+    Run a PowerShell script (from SCRIPT_DIR) and return parsed JSON from stdout.
     Raises RuntimeError on non-zero exit or invalid JSON.
     """
     if extra_args is None:
         extra_args = []
+
+    script_path = os.path.join(SCRIPT_DIR, script_name)
 
     cmd = [
         "powershell.exe",
@@ -26,7 +28,7 @@ def run_powershell_script(script_name: str, extra_args=None) -> dict:
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        script_name,
+        script_path,
         *extra_args,
     ]
 
@@ -54,10 +56,10 @@ def run_powershell_script(script_name: str, extra_args=None) -> dict:
         )
 
 
-def generate_month_ids(num_months: int = 6) -> list[str]:
+def _fallback_month_ids(num_months: int = 6) -> list[str]:
     """
-    Generate MSRC MonthIds (YYYY-MMM) going backwards one real month at a time
-    from the current month: e.g. ['2025-Nov', '2025-Oct', ...].
+    Fallback: generate MonthIds (YYYY-MMM) going backwards one REAL month
+    at a time from the current month. Only used if LCU info is broken/missing.
     """
     now = datetime.now(UTC).replace(day=1)
     year = now.year
@@ -67,10 +69,66 @@ def generate_month_ids(num_months: int = 6) -> list[str]:
     for _ in range(num_months):
         dt = datetime(year, month, 1, tzinfo=UTC)
         month_ids.append(dt.strftime("%Y-%b"))
+
         month -= 1
         if month == 0:
             month = 12
             year -= 1
+
+    return month_ids
+
+
+def build_month_ids_from_lcu(
+    baseline: dict,
+    fallback_months: int = 6,
+    max_months: int = 18,
+) -> list[str]:
+
+    """
+    Correct LCU→Now month range generator.
+
+    - Start at LCU month.
+    - Walk FORWARD month-by-month until *REAL CURRENT MONTH*.
+    - NEVER produce a future month (prevents 2025-Dec issue).
+    """
+
+    lcu_month_id = baseline.get("LCU_MonthId")
+    now = datetime.now(UTC).replace(day=1)
+
+    if not lcu_month_id:
+        return _fallback_month_ids(num_months=fallback_months)
+
+    try:
+        start = datetime.strptime(lcu_month_id, "%Y-%b").replace(day=1, tzinfo=UTC)
+    except ValueError:
+        return _fallback_month_ids(num_months=fallback_months)
+
+    # Fix: if start is in the future → fallback
+    if start > now:
+        return _fallback_month_ids(num_months=fallback_months)
+
+    year = start.year
+    month = start.month
+    month_ids: list[str] = []
+
+    while True:
+        dt = datetime(year, month, 1, tzinfo=UTC)
+
+        # Don't allow future months
+        if dt > now:
+            break
+
+        month_ids.append(dt.strftime("%Y-%b"))
+
+        # Stop if we reached current month or hit safety cap
+        if dt == now or len(month_ids) >= max_months:
+            break
+
+        # next month
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
 
     return month_ids
 
@@ -93,6 +151,7 @@ def main():
         f"{baseline.get('DisplayVersion')} "
         f"({baseline.get('FullBuild')})"
     )
+    print(f"[+] LCU_MonthId: {baseline.get('LCU_MonthId')}")
     print()
 
     # ------------------------------------------------------------------
@@ -105,13 +164,12 @@ def main():
     print()
 
     # ------------------------------------------------------------------
-    # MSRC month range: last 6 months from now
+    # MSRC month range: strictly LCU → now (with small safety fallback)
     # ------------------------------------------------------------------
-    month_ids = generate_month_ids(num_months=6)
+    month_ids = build_month_ids_from_lcu(baseline, fallback_months=6)
     print(f"[*] Querying MSRC for months: {', '.join(month_ids)}")
 
-    month_ids_arg = ",".join(month_ids)
-    extra_args = ["-MonthIds", month_ids_arg, "-ProductNameHint", product_hint]
+    extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]
     msrc_data = run_powershell_script(MSRC_ADAPTER_SCRIPT, extra_args=extra_args)
 
     kb_entries = msrc_data.get("KbEntries") or []
@@ -188,17 +246,8 @@ def main():
         print(f"{kb:<10} {status:<10} {months:<15} {cve_display}")
 
     # ------------------------------------------------------------------
-    # Catalog availability from downloader (Downloadable / Unavailable)
+    # Missing KBs list (for downloader)
     # ------------------------------------------------------------------
-    catalog_status: dict[str, str] = {}
-    status_path = os.path.join(SCRIPT_DIR, "winshield_catalog_status.json")
-    if os.path.isfile(status_path):
-        try:
-            with open(status_path, "r", encoding="utf-8") as f:
-                catalog_status = json.load(f)
-        except Exception:
-            catalog_status = {}
-
     print()
     print("=== Missing KBs that WinShield could download/patch next ===")
     if not missing_kbs:
@@ -208,12 +257,7 @@ def main():
             entry = kb_index.get(kb, {})
             months = ",".join(entry.get("Months") or [])
             cves = entry.get("Cves") or []
-            cat = catalog_status.get(kb)
-            catalog_word = cat if cat in ("Downloadable", "Unavailable") else "Unknown"
-            print(
-                f"- {kb} (months: {months}, CVEs: {len(set(cves))}, "
-                f"Catalog: {catalog_word})"
-            )
+            print(f"- {kb} (months: {months}, CVEs: {len(set(cves))})")
 
     # ------------------------------------------------------------------
     # Export machine-readable result for downloader / installer

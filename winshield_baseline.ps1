@@ -30,9 +30,27 @@ function Get-WinShieldProductNameHint {
 
         # Detect current OS
         $os = Get-CimInstance Win32_OperatingSystem
-        $osFullName = $os.Caption                     # "Microsoft Windows 11 Home"
-        $osMajor    = ($osFullName -replace '^Microsoft ', '')
-        $arch       = if ($os.OSArchitecture -match "64") { "x64" } else { "x86" }
+        $osFullName = $os.Caption                     # "Microsoft Windows 11 Home", "Microsoft Windows 10 Pro"
+        $osArchRaw  = $os.OSArchitecture              # "64-bit", "32-bit"
+        $arch       = if ($osArchRaw -match "64") { "x64" } else { "x86" }
+
+        # Normalise family: "Windows 11" or "Windows 10" etc.
+        $osFamily = $null
+        if ($osFullName -like "*Windows 11*") {
+            $osFamily = "Windows 11"
+        } elseif ($osFullName -like "*Windows 10*") {
+            $osFamily = "Windows 10"
+        } else {
+            # Fallback – strip "Microsoft "
+            $osFamily = ($osFullName -replace '^Microsoft\s+', '')
+        }
+
+        # Get display version (22H2, 23H2, 25H2, etc.) from registry
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        $displayVersion = $cv.DisplayVersion
+        if (-not $displayVersion) {
+            $displayVersion = $cv.ReleaseId
+        }
 
         # Query MSRC for this month
         $doc = Get-MsrcCvrfDocument -ID $MonthId -ErrorAction Stop
@@ -41,23 +59,49 @@ function Get-WinShieldProductNameHint {
         # Unique product names
         $names = $aff | Select-Object -ExpandProperty FullProductName -Unique
 
-        # Filter matching our OS major string and arch
+        # 1) candidates for this OS family + arch
         $candidates = $names |
-            Where-Object { $_ -like "$osMajor*" -and $_ -like "*$arch*" } |
+            Where-Object { $_ -like "$osFamily*for *$arch-based Systems*" } |
             Sort-Object
 
-        if (-not $candidates) {
-            $candidates = $names | Sort-Object
+        # 2) if we know a displayVersion like "22H2", prefer that
+        if ($displayVersion) {
+            $versionToken1 = $displayVersion                  # "22H2"
+            $versionToken2 = "Version $displayVersion"        # "Version 22H2"
+
+            $candidatesForVersion = $candidates |
+                Where-Object {
+                    $_ -like "*$versionToken2*" -or $_ -like "*$versionToken1*"
+                } |
+                Sort-Object
+
+            if ($candidatesForVersion) {
+                $candidates = $candidatesForVersion
+            }
         }
 
-        # Prefer entries with "Version", pick the last (newest) one
+        # 3) Fallback: if still nothing, use all names that start with family
+        if (-not $candidates -and $osFamily) {
+            $candidates = $names |
+                Where-Object { $_ -like "$osFamily*" } |
+                Sort-Object
+        }
+
+        if (-not $candidates) {
+            # Total fallback – just pick any Windows name with arch
+            $candidates = $names |
+                Where-Object { $_ -like "Windows*for *$arch-based Systems*" } |
+                Sort-Object
+        }
+
+        # Prefer entries with "Version", pick the last (newest)
         $best = $candidates |
             Where-Object { $_ -like "*Version*" } |
             Sort-Object |
             Select-Object -Last 1
 
         if (-not $best) {
-            $best = $candidates | Select-Object -Last 1
+            $best = $candidates | Sort-Object | Select-Object -Last 1
         }
 
         return $best
@@ -89,7 +133,7 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     default { $env:PROCESSOR_ARCHITECTURE }
 }
 
-# Admin check (fixed syntax)
+# Admin check
 $isAdmin = (
     New-Object Security.Principal.WindowsPrincipal(
         [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -119,7 +163,7 @@ if ($isAdmin) {
     }
 }
 
-# Derive LCU month id for MSRC range
+# Derive LCU month id for future use if needed
 $lcuMonthId = $null
 if ($lcuTime) {
     $lcuMonthId = (Get-Date $lcuTime).ToString("yyyy-MMM")  # e.g. 2025-Nov
