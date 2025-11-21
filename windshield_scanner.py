@@ -56,56 +56,53 @@ def run_powershell_script(script_name: str, extra_args=None) -> dict:
         )
 
 
-def _fallback_month_ids(num_months: int = 6) -> list[str]:
-    """
-    Fallback: generate MonthIds (YYYY-MMM) going backwards one REAL month
-    at a time from the current month. Only used if LCU info is broken/missing.
-    """
-    now = datetime.now(UTC).replace(day=1)
-    year = now.year
-    month = now.month
-    month_ids: list[str] = []
-
-    for _ in range(num_months):
-        dt = datetime(year, month, 1, tzinfo=UTC)
-        month_ids.append(dt.strftime("%Y-%b"))
-
-        month -= 1
-        if month == 0:
-            month = 12
-            year -= 1
-
-    return month_ids
-
-
 def build_month_ids_from_lcu(
     baseline: dict,
-    fallback_months: int = 6,
     max_months: int = 18,
 ) -> list[str]:
-
     """
-    Correct LCU→Now month range generator.
+    LCU-driven month range generator.
 
-    - Start at LCU month.
-    - Walk FORWARD month-by-month until *REAL CURRENT MONTH*.
-    - NEVER produce a future month (prevents 2025-Dec issue).
+    - Requires baseline["IsAdmin"] to be true.
+    - Requires a valid baseline["LCU_MonthId"] like "2025-Nov".
+    - Walks forward month by month from LCU month up to the real current month.
+    - No guessing, no fallback. If something is missing, we raise.
     """
+
+    if not baseline.get("IsAdmin"):
+        raise RuntimeError(
+            "WinShield baseline was collected without administrative privileges.\n"
+            "LCU detection requires Get-WindowsPackage, which only works when PowerShell "
+            "is run as Administrator.\n\n"
+            "Please rerun the scanner from an elevated PowerShell window:\n"
+            "  - Right-click PowerShell and choose 'Run as administrator'\n"
+            "  - Then run winshield_scanner.py again."
+        )
 
     lcu_month_id = baseline.get("LCU_MonthId")
-    now = datetime.now(UTC).replace(day=1)
-
     if not lcu_month_id:
-        return _fallback_month_ids(num_months=fallback_months)
+        raise RuntimeError(
+            "Baseline did not provide LCU_MonthId.\n"
+            "This means winshield_baseline.ps1 did not map the latest cumulative update.\n"
+            "Run winshield_lcu_debug.ps1 as Administrator and adjust LCU detection in "
+            "winshield_baseline.ps1 so it picks the correct Package_for_RollupFix entry."
+        )
+
+    now = datetime.now(UTC).replace(day=1)
 
     try:
         start = datetime.strptime(lcu_month_id, "%Y-%b").replace(day=1, tzinfo=UTC)
-    except ValueError:
-        return _fallback_month_ids(num_months=fallback_months)
+    except ValueError as e:
+        raise RuntimeError(
+            f"LCU_MonthId '{lcu_month_id}' is not in 'YYYY-MMM' format: {e}.\n"
+            "Fix LCU_MonthId formatting in winshield_baseline.ps1."
+        )
 
-    # Fix: if start is in the future → fallback
     if start > now:
-        return _fallback_month_ids(num_months=fallback_months)
+        raise RuntimeError(
+            f"LCU_MonthId '{lcu_month_id}' is in the future compared to current month.\n"
+            "This is probably a bug in winshield_baseline.ps1 LCU handling."
+        )
 
     year = start.year
     month = start.month
@@ -113,18 +110,14 @@ def build_month_ids_from_lcu(
 
     while True:
         dt = datetime(year, month, 1, tzinfo=UTC)
-
-        # Don't allow future months
         if dt > now:
             break
 
         month_ids.append(dt.strftime("%Y-%b"))
 
-        # Stop if we reached current month or hit safety cap
         if dt == now or len(month_ids) >= max_months:
             break
 
-        # next month
         month += 1
         if month == 13:
             month = 1
@@ -166,10 +159,13 @@ def main():
     # ------------------------------------------------------------------
     # MSRC month range: strictly LCU → now (with small safety fallback)
     # ------------------------------------------------------------------
-    month_ids = build_month_ids_from_lcu(baseline, fallback_months=6)
+    month_ids = build_month_ids_from_lcu(baseline)
     print(f"[*] Querying MSRC for months: {', '.join(month_ids)}")
 
-    extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]
+    # Pass MonthIds as a single comma separated string so it works with both
+    # [string]$MonthIds and [string[]]$MonthIds in the adapter script
+    month_ids_arg = ",".join(month_ids)
+    extra_args = ["-MonthIds", month_ids_arg, "-ProductNameHint", product_hint]
     msrc_data = run_powershell_script(MSRC_ADAPTER_SCRIPT, extra_args=extra_args)
 
     kb_entries = msrc_data.get("KbEntries") or []

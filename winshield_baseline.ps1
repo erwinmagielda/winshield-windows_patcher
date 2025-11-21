@@ -140,6 +140,10 @@ $isAdmin = (
     )
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+if (-not $isAdmin) {
+    Write-Warning "WinShield baseline is not running as Administrator. LCU_PackageName, LCU_InstallTime and LCU_MonthId will be null because Get-WindowsPackage requires elevation."
+}
+
 # -------------------------------------------------------------------------
 # Detect latest LCU (if admin)
 # -------------------------------------------------------------------------
