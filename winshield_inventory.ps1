@@ -9,7 +9,6 @@ WinShield local KB inventory
 
 function Get-WinShieldInventory {
 
-    # --- detect admin: use explicit objects to avoid parser issues ---
     $windowsIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
     $isAdmin          = $windowsPrincipal.IsInRole(
@@ -59,7 +58,6 @@ function Get-WinShieldInventory {
     }
 }
 
-# When run as script, emit JSON
 if ($MyInvocation.InvocationName -ne '.') {
     Get-WinShieldInventory | ConvertTo-Json -Depth 4
 }

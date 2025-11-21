@@ -1,39 +1,80 @@
 <#
 .SYNOPSIS
-WinShield MSRC adapter (stable multi-month version)
+    WinShield MSRC adapter (manual arg parser, multi-month safe)
 
-- Accepts multiple MonthIds via proper PowerShell binding
-- Queries MSRC module for each month
-- Filters by ProductNameHint
-- Returns KB list with CVEs + Supersedes
-- Fully JSON safe
+.DESCRIPTION
+    - Accepts multiple MonthIds from CLI (Python or manual):
+        winshield_msrc_adapter.ps1 -MonthIds 2025-Nov 2025-Oct ...
+      or:
+        winshield_msrc_adapter.ps1 -MonthIds "2025-Nov,2025-Oct,2025-Sep" ...
+    - Accepts ProductNameHint
+    - Queries MsrcSecurityUpdates for each month
+    - Filters by ProductNameHint
+    - Returns KB list with CVEs and Supersedes as JSON
 #>
 
-param(
-    [Parameter(Mandatory = $true)]
-    [string[]]$MonthIds,
+# -------------------------------------------------------------
+# Manual argument parsing to avoid PowerShell param binding quirks
+# -------------------------------------------------------------
 
-    [Parameter(Mandatory = $true)]
-    [string]$ProductNameHint
-)
+$MonthIds = @()
+$ProductNameHint = $null
 
-# --- Normalise MonthIds ---
-# Accepts:
-#   -MonthIds 2025-Nov 2025-Oct
-#   -MonthIds "2025-Nov,2025-Oct,2025-Sep"
-#   or any mix of the above
+for ($i = 0; $i -lt $args.Count; $i++) {
+    switch -Regex ($args[$i]) {
+
+        '^-MonthIds$' {
+            $i++
+            while ($i -lt $args.Count -and $args[$i] -notmatch '^-') {
+                $MonthIds += $args[$i]
+                $i++
+            }
+            $i--
+            continue
+        }
+
+        '^-ProductNameHint$' {
+            $i++
+            if ($i -lt $args.Count) {
+                $ProductNameHint = $args[$i]
+            }
+            continue
+        }
+
+        default { }
+    }
+}
+
+if (-not $MonthIds -or -not $ProductNameHint) {
+    [pscustomobject]@{
+        Error  = "Usage: winshield_msrc_adapter.ps1 -MonthIds <list> -ProductNameHint <name>"
+        RawArgs = $args
+    } | ConvertTo-Json -Depth 5
+    exit 1
+}
+
+# -------------------------------------------------------------
+# Normalise MonthIds: split on commas, trim, dedupe
+# -------------------------------------------------------------
+
 $normMonths = @()
 foreach ($m in $MonthIds) {
     if (-not $m) { continue }
     $parts = $m -split ","
     foreach ($p in $parts) {
         $val = $p.Trim()
-        if ($val) { $normMonths += $val }
+        if ($val) {
+            $normMonths += $val
+        }
     }
 }
-$MonthIds = $normMonths | Select-Object -Unique
 
-# --- Load module ---
+$MonthIds = $normMonths | Sort-Object -Unique
+
+# -------------------------------------------------------------
+# Load MSRC module
+# -------------------------------------------------------------
+
 try {
     Import-Module -Name MsrcSecurityUpdates -ErrorAction Stop
 } catch {
@@ -44,12 +85,14 @@ try {
     exit 1
 }
 
-# KB map
+# -------------------------------------------------------------
+# Build KB map for all months
+# -------------------------------------------------------------
+
 $kbMap = @{}
 
 foreach ($month in $MonthIds) {
 
-    # Query MSRC
     try {
         $doc = Get-MsrcCvrfDocument -ID $month -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
@@ -57,12 +100,11 @@ foreach ($month in $MonthIds) {
         continue
     }
 
-    # Rows matching our ProductNameHint
     $rows = $aff | Where-Object { $_.FullProductName -like "*$ProductNameHint*" }
     if (-not $rows) { continue }
 
     foreach ($row in $rows) {
-        # CVE list normalize
+
         $cveList = @()
         if ($row.CVE) {
             if ($row.CVE -is [System.Collections.IEnumerable] -and -not ($row.CVE -is [string])) {
@@ -72,7 +114,6 @@ foreach ($month in $MonthIds) {
             }
         }
 
-        # Supersedence cleanup
         $supers = @()
         if ($row.Supercedence) {
             foreach ($s in $row.Supercedence) {
@@ -85,7 +126,6 @@ foreach ($month in $MonthIds) {
             }
         }
 
-        # KBArticle processing
         if ($row.KBArticle) {
             foreach ($kbObj in $row.KBArticle) {
                 if (-not $kbObj.ID) { continue }
@@ -121,7 +161,6 @@ foreach ($month in $MonthIds) {
     }
 }
 
-# Output JSON
 [pscustomobject]@{
     ProductName = $ProductNameHint
     MonthIds    = $MonthIds

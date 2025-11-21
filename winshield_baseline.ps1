@@ -30,8 +30,8 @@ function Get-WinShieldProductNameHint {
 
         # Detect current OS
         $os = Get-CimInstance Win32_OperatingSystem
-        $osFullName = $os.Caption                     # "Microsoft Windows 11 Home", "Microsoft Windows 10 Pro"
-        $osArchRaw  = $os.OSArchitecture              # "64-bit", "32-bit"
+        $osFullName = $os.Caption
+        $osArchRaw  = $os.OSArchitecture
         $arch       = if ($osArchRaw -match "64") { "x64" } else { "x86" }
 
         # Normalise family: "Windows 11" or "Windows 10" etc.
@@ -41,7 +41,6 @@ function Get-WinShieldProductNameHint {
         } elseif ($osFullName -like "*Windows 10*") {
             $osFamily = "Windows 10"
         } else {
-            # Fallback – strip "Microsoft "
             $osFamily = ($osFullName -replace '^Microsoft\s+', '')
         }
 
@@ -66,8 +65,8 @@ function Get-WinShieldProductNameHint {
 
         # 2) if we know a displayVersion like "22H2", prefer that
         if ($displayVersion) {
-            $versionToken1 = $displayVersion                  # "22H2"
-            $versionToken2 = "Version $displayVersion"        # "Version 22H2"
+            $versionToken1 = $displayVersion
+            $versionToken2 = "Version $displayVersion"
 
             $candidatesForVersion = $candidates |
                 Where-Object {
@@ -88,7 +87,6 @@ function Get-WinShieldProductNameHint {
         }
 
         if (-not $candidates) {
-            # Total fallback – just pick any Windows name with arch
             $candidates = $names |
                 Where-Object { $_ -like "Windows*for *$arch-based Systems*" } |
                 Sort-Object
@@ -134,11 +132,11 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 
 # Admin check
-$isAdmin = (
-    New-Object Security.Principal.WindowsPrincipal(
-        [Security.Principal.WindowsIdentity]::GetCurrent()
-    )
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$windowsIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
+$isAdmin          = $windowsPrincipal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
 
 if (-not $isAdmin) {
     Write-Warning "WinShield baseline is not running as Administrator. LCU_PackageName, LCU_InstallTime and LCU_MonthId will be null because Get-WindowsPackage requires elevation."
@@ -152,14 +150,29 @@ $lcuTime    = $null
 
 if ($isAdmin) {
     try {
-        $rollups = Get-WindowsPackage -Online |
+        $allPkgs = Get-WindowsPackage -Online
+
+        # Prefer RollupFix
+        $rollups = $allPkgs |
             Where-Object { $_.PackageName -like "*RollupFix*" } |
-            Sort-Object -Property InstallTime -Descending
+            Sort-Object InstallTime -Descending
+
+        if (-not $rollups -or $rollups.Count -eq 0) {
+            # fallback: Description / PackageName (if MS changes naming)
+            $rollups = $allPkgs |
+                Where-Object {
+                    ($_.Description -like "*Cumulative Update*" -or $_.Description -like "*LCU*") -or
+                    ($_.PackageName -like "*Cumulative Update*" -or $_.PackageName -like "*LCU*")
+                } |
+                Sort-Object InstallTime -Descending
+        }
 
         if ($rollups -and $rollups.Count -gt 0) {
             $lcu = $rollups[0]
             $lcuPkgName = $lcu.PackageName
             $lcuTime    = $lcu.InstallTime
+        } else {
+            Write-Error "Could not identify LCU package. Adjust filters in winshield_baseline.ps1."
         }
     }
     catch {
@@ -167,16 +180,16 @@ if ($isAdmin) {
     }
 }
 
-# Derive LCU month id for future use if needed
+# Derive LCU month id for scanner
 $lcuMonthId = $null
 if ($lcuTime) {
-    $lcuMonthId = (Get-Date $lcuTime).ToString("yyyy-MMM")  # e.g. 2025-Nov
+    $lcuMonthId = (Get-Date $lcuTime).ToString("yyyy-MMM")
 }
 
 # -------------------------------------------------------------------------
 # Auto-detect MSRC ProductNameHint for current month
 # -------------------------------------------------------------------------
-$monthId = (Get-Date).ToString("yyyy-MMM")  # e.g. "2025-Nov"
+$monthId = (Get-Date).ToString("yyyy-MMM")
 $productHint = Get-WinShieldProductNameHint -MonthId $monthId
 
 # -------------------------------------------------------------------------

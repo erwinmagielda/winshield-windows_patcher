@@ -1,3 +1,4 @@
+# winshield_scanner.py
 import json
 import os
 import subprocess
@@ -157,15 +158,12 @@ def main():
     print()
 
     # ------------------------------------------------------------------
-    # MSRC month range: strictly LCU → now (with small safety fallback)
+    # MSRC month range: strictly LCU -> now
     # ------------------------------------------------------------------
     month_ids = build_month_ids_from_lcu(baseline)
     print(f"[*] Querying MSRC for months: {', '.join(month_ids)}")
 
-    # Pass MonthIds as a single comma separated string so it works with both
-    # [string]$MonthIds and [string[]]$MonthIds in the adapter script
-    month_ids_arg = ",".join(month_ids)
-    extra_args = ["-MonthIds", month_ids_arg, "-ProductNameHint", product_hint]
+    extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]
     msrc_data = run_powershell_script(MSRC_ADAPTER_SCRIPT, extra_args=extra_args)
 
     kb_entries = msrc_data.get("KbEntries") or []
@@ -282,10 +280,8 @@ if __name__ == "__main__":
         print(f"[!] Fatal error: {e}")
         exit_code = 1
     finally:
-        # Always pause so you can read the output
         try:
             input("\nPress Enter to close this window...")
         except EOFError:
-            # In case input is not available (called from another script)
             pass
         sys.exit(exit_code)
