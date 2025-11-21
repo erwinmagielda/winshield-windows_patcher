@@ -281,6 +281,15 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+        exit_code = 0
     except Exception as e:
         print(f"[!] Fatal error: {e}")
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        # Always pause so you can read the output
+        try:
+            input("\nPress Enter to close this window...")
+        except EOFError:
+            # In case input is not available (called from another script)
+            pass
+        sys.exit(exit_code)

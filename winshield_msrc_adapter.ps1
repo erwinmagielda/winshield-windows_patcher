@@ -6,7 +6,8 @@ WinShield MSRC adapter (stable multi-month version)
 - Queries MSRC module for each month
 - Filters by ProductNameHint
 - Returns KB list with CVEs + Supersedes
-- Fully JSON safe
+- Ignores non-mainline KBs (e.g. Security Hotpatch Update) by default
+- Emits JSON for Python scanner
 #>
 
 param(
@@ -17,26 +18,19 @@ param(
     [string]$ProductNameHint
 )
 
-# --- Normalise MonthIds ---
-# Accepts:
-#   -MonthIds 2025-Nov 2025-Oct
-#   -MonthIds "2025-Nov,2025-Oct,2025-Sep"
-#   or any mix of the above
-$normMonths = @()
-foreach ($m in $MonthIds) {
-    if (-not $m) { continue }
-    $parts = $m -split ","
-    foreach ($p in $parts) {
-        $val = $p.Trim()
-        if ($val) { $normMonths += $val }
-    }
+# --- Ensure MonthIds is always an array of clean strings ---
+if ($MonthIds -is [string]) {
+    $MonthIds = $MonthIds -split ","
 }
-$MonthIds = $normMonths | Select-Object -Unique
+$MonthIds = $MonthIds |
+    ForEach-Object { ($_ -as [string]).Trim() } |
+    Where-Object { $_ }
 
-# --- Load module ---
+# --- Load MSRC module ---
 try {
     Import-Module -Name MsrcSecurityUpdates -ErrorAction Stop
-} catch {
+}
+catch {
     [pscustomobject]@{
         Error   = "Failed to load MsrcSecurityUpdates"
         Details = $_.Exception.Message
@@ -44,16 +38,17 @@ try {
     exit 1
 }
 
-# KB map
+# Map: KB -> object { KB, Months[], Cves[], Supersedes[] }
 $kbMap = @{}
 
 foreach ($month in $MonthIds) {
 
-    # Query MSRC
     try {
         $doc = Get-MsrcCvrfDocument -ID $month -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
-    } catch {
+    }
+    catch {
+        # If that month fails, just skip it – scanner will still work with others
         continue
     }
 
@@ -62,17 +57,19 @@ foreach ($month in $MonthIds) {
     if (-not $rows) { continue }
 
     foreach ($row in $rows) {
-        # CVE list normalize
+
+        # Normalise CVE list
         $cveList = @()
         if ($row.CVE) {
             if ($row.CVE -is [System.Collections.IEnumerable] -and -not ($row.CVE -is [string])) {
                 $cveList = @($row.CVE)
-            } else {
+            }
+            else {
                 $cveList = @($row.CVE)
             }
         }
 
-        # Supersedence cleanup
+        # Supersedence cleanup (values like {, 5066835, , ...})
         $supers = @()
         if ($row.Supercedence) {
             foreach ($s in $row.Supercedence) {
@@ -88,9 +85,18 @@ foreach ($month in $MonthIds) {
         # KBArticle processing
         if ($row.KBArticle) {
             foreach ($kbObj in $row.KBArticle) {
+
+                # Skip anything that is not a mainline Security Update
+                # (e.g. Security Hotpatch Update, Tooling, Docs, etc.)
+                $subType = $kbObj.SubType
+                if ($subType -and ($subType -ne "Security Update")) {
+                    continue
+                }
+
                 if (-not $kbObj.ID) { continue }
 
-                $kb = if ($kbObj.ID -like "KB*") { $kbObj.ID } else { "KB$($kbObj.ID)" }
+                $kbId = $kbObj.ID
+                $kb   = if ($kbId -like "KB*") { $kbId } else { "KB$kbId" }
 
                 if (-not $kbMap.ContainsKey($kb)) {
                     $kbMap[$kb] = [pscustomobject]@{
@@ -101,16 +107,19 @@ foreach ($month in $MonthIds) {
                     }
                 }
 
+                # Month
                 if ($kbMap[$kb].Months -notcontains $month) {
                     $kbMap[$kb].Months += $month
                 }
 
+                # CVEs
                 foreach ($c in $cveList) {
-                    if ($kbMap[$kb].Cves -notcontains $c) {
+                    if ($c -and $kbMap[$kb].Cves -notcontains $c) {
                         $kbMap[$kb].Cves += $c
                     }
                 }
 
+                # Supersedes (KBs this KB replaces)
                 foreach ($s in $supers) {
                     if ($kbMap[$kb].Supersedes -notcontains $s) {
                         $kbMap[$kb].Supersedes += $s
