@@ -1,17 +1,18 @@
 """
-WinShield Downloader (download-only, JSON summary)
+WinShield Downloader (download-only, JSON summary with selection)
 
 - Loads winshield_scan_result.json produced by winshield_scanner.py.
-- For each missing KB:
+- Presents missing KBs with numeric IDs.
+- User can choose:
+      → 'all'  (default) to download all missing KBs
+      → or a selection: e.g. '1-3,5,8'
+- For each selected KB:
       → Resolve Microsoft Update Catalog download URL.
       → Download .msu/.cab file into ./downloads/.
       → Record status: Downloaded / Unavailable / Failed.
-- Writes winshield_download_result.json with a detailed summary.
+- Non-selected KBs are recorded as Skipped.
 
-Future extension:
-- Present missing KBs with numeric IDs.
-- Allow the user to select subsets and ranges (eg "1-3,5,7").
-- Integrate simple type hints (LCU-like vs other) once classification is in place.
+Writes winshield_download_result.json with a detailed summary.
 """
 
 import json
@@ -35,10 +36,7 @@ USER_AGENT = (
 
 
 def http_get(url: str, params: Dict[str, str] | None = None, timeout: int = 30) -> Optional[requests.Response]:
-    """
-    Perform an HTTP GET with a fixed User-Agent and optional query parameters.
-    Returns the Response object or None when the request fails.
-    """
+    """Perform an HTTP GET with a fixed User-Agent and optional query parameters."""
     try:
         return requests.get(
             url,
@@ -52,10 +50,7 @@ def http_get(url: str, params: Dict[str, str] | None = None, timeout: int = 30) 
 
 
 def http_post_form(url: str, body: Dict[str, str], timeout: int = 30) -> Optional[requests.Response]:
-    """
-    Perform an HTTP POST with form-encoded data.
-    Returns the Response object or None when the request fails.
-    """
+    """Perform an HTTP POST with form-encoded data."""
     try:
         return requests.post(
             url,
@@ -75,8 +70,7 @@ def extract_guids(html: str) -> List[str]:
     """
     Extract GUIDs from the Microsoft Update Catalog search results page.
 
-    The GUID format is:
-      8-4-4-4-12 hex digits, eg: 01234567-89ab-cdef-0123-456789abcdef
+    GUID format: 8-4-4-4-12 hex digits, e.g. 01234567-89ab-cdef-0123-456789abcdef
     """
     guids = re.findall(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
@@ -117,8 +111,8 @@ def choose_file_url(dialog_html: str, kb_digits: str, bitness: str) -> Optional[
     """
     Select the best candidate MSU or CAB file URL from the DownloadDialog markup.
 
-    The scoring favours:
-      - URLs containing the KB token (eg "kb5026361")
+    Scoring favours:
+      - URLs containing the KB token (e.g. "kb5026361")
       - URLs matching architecture (x64 vs x86)
       - MSU files over CAB when multiple are present
     """
@@ -211,6 +205,51 @@ def download_file(url: str, dest: str) -> Optional[int]:
         return None
 
 
+def parse_id_selection(selection: str, max_id: int) -> List[int]:
+    """
+    Parse an ID selection string such as '1-3,5,8' into a list of integers.
+    Invalid segments are ignored.
+
+    :param selection: Raw user input.
+    :param max_id:   Upper bound for valid IDs (inclusive).
+    :return: Sorted list of unique IDs.
+    """
+    selection = selection.strip()
+    if not selection:
+        return []
+
+    ids: set[int] = set()
+
+    for part in selection.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            # Range segment, for example "2-5"
+            start_str, end_str = part.split("-", 1)
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
+            for i in range(start, end + 1):
+                if 1 <= i <= max_id:
+                    ids.add(i)
+        else:
+            # Single ID
+            try:
+                val = int(part)
+            except ValueError:
+                continue
+            if 1 <= val <= max_id:
+                ids.add(val)
+
+    return sorted(ids)
+
+
 def main() -> None:
     if not os.path.isfile(SCAN_RESULT_PATH):
         print("[X] winshield_scan_result.json not found. Run winshield_scanner.py first.")
@@ -221,6 +260,7 @@ def main() -> None:
 
     baseline = scan.get("baseline") or {}
     missing_kbs: List[str] = scan.get("missing_kbs") or []
+    kb_entries: List[Dict[str, Any]] = scan.get("kb_entries") or []
 
     if not missing_kbs:
         print("[+] No missing KBs according to the last WinShield scan. System is up to date for the scanned MSRC window.")
@@ -232,14 +272,79 @@ def main() -> None:
     bitness = "64" if "64" in architecture else "32"
 
     print(f"[*] OS: {os_name} | Build: {build} | Architecture: {architecture}")
-    print(f"[*] Missing KBs reported by scanner: {', '.join(missing_kbs)}")
+    print("[*] Missing KBs from WinShield scan will be presented with IDs.")
+    print()
+
+    # Build a quick index from KB ID to its MSRC metadata
+    kb_index: Dict[str, Dict[str, Any]] = {entry["KB"]: entry for entry in kb_entries if "KB" in entry}
+
+    # Prepare list of missing KBs with metadata for display
+    missing_info: List[Dict[str, Any]] = []
+    for idx, kb in enumerate(sorted(missing_kbs), start=1):
+        entry = kb_index.get(kb, {})
+        months = entry.get("Months") or []
+        cves = entry.get("Cves") or []
+        cve_count = len(set(cves))
+        missing_info.append(
+            {
+                "id": idx,
+                "kb": kb,
+                "months": months,
+                "cve_count": cve_count,
+            }
+        )
+
+    # Print selection table
+    print("ID  KB         Months              CVEs")
+    print("------------------------------------------------------------")
+    for item in missing_info:
+        kb = item["kb"]
+        months_display = ",".join(item["months"]) if item["months"] else ""
+        cve_count = item["cve_count"]
+        print(f"{item['id']:<3} {kb:<10} {months_display:<20} {cve_count}")
+    print("------------------------------------------------------------")
+    print("Enter KB IDs to download, e.g.:")
+    print("  - 'all' to download all listed KBs")
+    print("  - '1-3,5,8' to download a subset")
+    print()
+
+    selection_raw = input("IDs to download (default = 'all'): ").strip()
+
+    if not selection_raw or selection_raw.lower() == "all":
+        selected_ids = [item["id"] for item in missing_info]
+        print("[*] No explicit selection provided, defaulting to all missing KBs.")
+    else:
+        selected_ids = parse_id_selection(selection_raw, max_id=len(missing_info))
+        if not selected_ids:
+            print("[!] Parsed selection is empty or invalid. No downloads will be attempted.")
+            selected_ids = []
+
+    selected_id_set = set(selected_ids)
+    print(f"[*] Selected IDs for download: {', '.join(map(str, sorted(selected_id_set))) if selected_id_set else '(none)'}")
     print("============================================================")
 
     results: List[Dict[str, Any]] = []
 
-    for kb in missing_kbs:
-        kb_digits = re.sub(r"[^0-9]", "", kb)
+    for item in missing_info:
+        kb = item["kb"]
+        kb_id = item["id"]
 
+        if kb_id not in selected_id_set:
+            # Record that this KB was intentionally skipped
+            results.append(
+                {
+                    "kb": kb,
+                    "digits": re.sub(r"[^0-9]", "", kb),
+                    "status": "Skipped",
+                    "reason": "Not selected for download",
+                    "url": None,
+                    "local_path": None,
+                    "size_bytes": None,
+                }
+            )
+            continue
+
+        kb_digits = re.sub(r"[^0-9]", "", kb)
         if not kb_digits:
             print(f"[!] Cannot extract digits from {kb}, marking as Unavailable.")
             results.append(
