@@ -12,7 +12,7 @@ WinShield Downloader (download-only, JSON summary with selection)
       → Record status: Downloaded / Unavailable / Failed.
 - Non-selected KBs are recorded as Skipped.
 
-Writes winshield_download_result.json with a detailed summary.
+Writes results/winshield_download_result.json with a detailed summary.
 """
 
 import json
@@ -24,9 +24,15 @@ from typing import Optional, Dict, Any, List
 import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DOWNLOADS_DIR = os.path.join(SCRIPT_DIR, "downloads")
-SCAN_RESULT_PATH = os.path.join(SCRIPT_DIR, "winshield_scan_result.json")
-DOWNLOAD_RESULT_PATH = os.path.join(SCRIPT_DIR, "winshield_download_result.json")
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+SCAN_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_scan_result.json")
+DOWNLOAD_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_download_result.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -148,14 +154,6 @@ def choose_file_url(dialog_html: str, kb_digits: str, bitness: str) -> Optional[
 def resolve_download_for_kb(kb_digits: str, os_name: str, build: str, bitness: str) -> Optional[str]:
     """
     Resolve a Microsoft Update Catalog download URL for a given KB number.
-
-    Steps:
-      - Submit a catalog search for "KB<digits>".
-      - Extract candidate GUIDs from the result page.
-      - Query each GUID's DownloadDialog.aspx endpoint.
-      - Select the best matching file URL from the dialog HTML.
-
-    Returns the URL string or None when resolution fails.
     """
     search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
     response = http_get(search_url, params={"q": f"KB{kb_digits}"})
@@ -209,10 +207,6 @@ def parse_id_selection(selection: str, max_id: int) -> List[int]:
     """
     Parse an ID selection string such as '1-3,5,8' into a list of integers.
     Invalid segments are ignored.
-
-    :param selection: Raw user input.
-    :param max_id:   Upper bound for valid IDs (inclusive).
-    :return: Sorted list of unique IDs.
     """
     selection = selection.strip()
     if not selection:
@@ -226,7 +220,6 @@ def parse_id_selection(selection: str, max_id: int) -> List[int]:
             continue
 
         if "-" in part:
-            # Range segment, for example "2-5"
             start_str, end_str = part.split("-", 1)
             try:
                 start = int(start_str)
@@ -239,7 +232,6 @@ def parse_id_selection(selection: str, max_id: int) -> List[int]:
                 if 1 <= i <= max_id:
                     ids.add(i)
         else:
-            # Single ID
             try:
                 val = int(part)
             except ValueError:
@@ -252,7 +244,7 @@ def parse_id_selection(selection: str, max_id: int) -> List[int]:
 
 def main() -> None:
     if not os.path.isfile(SCAN_RESULT_PATH):
-        print("[X] winshield_scan_result.json not found. Run winshield_scanner.py first.")
+        print("[X] winshield_scan_result.json not found in results/. Run winshield_scanner.py first.")
         sys.exit(1)
 
     with open(SCAN_RESULT_PATH, "r", encoding="utf-8") as handle:
@@ -275,10 +267,8 @@ def main() -> None:
     print("[*] Missing KBs from WinShield scan will be presented with IDs.")
     print()
 
-    # Build a quick index from KB ID to its MSRC metadata
     kb_index: Dict[str, Dict[str, Any]] = {entry["KB"]: entry for entry in kb_entries if "KB" in entry}
 
-    # Prepare list of missing KBs with metadata for display
     missing_info: List[Dict[str, Any]] = []
     for idx, kb in enumerate(sorted(missing_kbs), start=1):
         entry = kb_index.get(kb, {})
@@ -294,7 +284,6 @@ def main() -> None:
             }
         )
 
-    # Print selection table
     print("ID  KB         Months              CVEs")
     print("------------------------------------------------------------")
     for item in missing_info:
@@ -330,7 +319,6 @@ def main() -> None:
         kb_id = item["id"]
 
         if kb_id not in selected_id_set:
-            # Record that this KB was intentionally skipped
             results.append(
                 {
                     "kb": kb,
@@ -425,7 +413,7 @@ def main() -> None:
     with open(DOWNLOAD_RESULT_PATH, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
-    print("\n[+] Download results saved to winshield_download_result.json")
+    print(f"\n[+] Download results saved to {DOWNLOAD_RESULT_PATH}")
     print("[*] Download-only run complete.")
 
 

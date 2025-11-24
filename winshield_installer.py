@@ -1,13 +1,13 @@
 """
 WinShield Installer
 
-- Loads winshield_download_result.json produced by winshield_downloader.py.
-- Creates a backup of the last scan result as winshield_scan_before_install.json
+- Loads results/winshield_download_result.json produced by winshield_downloader.py.
+- Creates a backup of the last scan result as results/winshield_scan_before_install.json
   if it exists and no backup is present yet.
 - Installs all KB packages with status == "Downloaded" via:
       * wusa.exe for .msu
       * dism.exe /online /add-package for .cab
-- Records per-KB install status in winshield_install_result.json.
+- Records per-KB install status in results/winshield_install_result.json.
 
 IMPORTANT:
 - Must be run from an elevated (Administrator) PowerShell or Command Prompt.
@@ -23,10 +23,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_RESULT_PATH = os.path.join(SCRIPT_DIR, "winshield_download_result.json")
-INSTALL_RESULT_PATH = os.path.join(SCRIPT_DIR, "winshield_install_result.json")
-SCAN_RESULT_PATH = os.path.join(SCRIPT_DIR, "winshield_scan_result.json")
-SCAN_BEFORE_PATH = os.path.join(SCRIPT_DIR, "winshield_scan_before_install.json")
+
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+DOWNLOAD_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_download_result.json")
+INSTALL_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_install_result.json")
+SCAN_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_scan_result.json")
+SCAN_BEFORE_PATH = os.path.join(RESULTS_DIR, "winshield_scan_before_install.json")
 
 
 def is_admin() -> bool:
@@ -46,18 +50,12 @@ def run_subprocess(cmd: List[str]) -> Tuple[int, str, str]:
         result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode, result.stdout, result.stderr
     except Exception as exc:
-        # Use -1 as a sentinel exit code for local failures
         return -1, "", f"Exception during subprocess.run: {exc}"
 
 
 def interpret_wusa_exit_code(exit_code: int) -> Tuple[str, str | None]:
     """
     Map WUSA exit codes to a logical status and human-readable reason.
-
-    Common codes:
-      0        - Success
-      3010     - Success, reboot required
-      2359302  - Update already installed
     """
     if exit_code == 0:
         return "Installed", None
@@ -72,12 +70,6 @@ def interpret_wusa_exit_code(exit_code: int) -> Tuple[str, str | None]:
 def interpret_dism_exit_code(exit_code: int) -> Tuple[str, str | None]:
     """
     Map DISM exit codes to a logical status and human-readable reason.
-
-    Common codes:
-      0     - Success
-      3010  - Success, reboot required
-      1641  - Success, reboot initiated
-    All other codes are treated as failures and logged with the raw exit code.
     """
     if exit_code == 0:
         return "Installed", None
@@ -97,7 +89,6 @@ def install_msu(local_path: str) -> Tuple[str, int, str | None, str, str]:
     exit_code, stdout, stderr = run_subprocess(cmd)
 
     if exit_code == -1:
-        # Local failure before WUSA could run
         return "Failed", exit_code, "Failed to invoke wusa.exe", stdout, stderr
 
     status, reason = interpret_wusa_exit_code(exit_code)
@@ -121,7 +112,6 @@ def install_cab(local_path: str) -> Tuple[str, int, str | None, str, str]:
     exit_code, stdout, stderr = run_subprocess(cmd)
 
     if exit_code == -1:
-        # Local failure before DISM could run
         return "Failed", exit_code, "Failed to invoke dism.exe", stdout, stderr
 
     status, reason = interpret_dism_exit_code(exit_code)
@@ -130,7 +120,7 @@ def install_cab(local_path: str) -> Tuple[str, int, str | None, str, str]:
 
 def main() -> None:
     if not os.path.isfile(DOWNLOAD_RESULT_PATH):
-        print("[X] winshield_download_result.json not found. Run winshield_downloader.py first.")
+        print("[X] winshield_download_result.json not found in results/. Run winshield_downloader.py first.")
         sys.exit(1)
 
     if not is_admin():
@@ -138,7 +128,6 @@ def main() -> None:
         print("    Open an elevated PowerShell or Command Prompt and run this script again.")
         sys.exit(1)
 
-    # Backup the last scan result as "before install" snapshot (for verifier)
     if os.path.isfile(SCAN_RESULT_PATH) and not os.path.isfile(SCAN_BEFORE_PATH):
         try:
             shutil.copy2(SCAN_RESULT_PATH, SCAN_BEFORE_PATH)
@@ -152,7 +141,6 @@ def main() -> None:
     baseline = download_summary.get("baseline") or {}
     download_results: List[Dict[str, Any]] = download_summary.get("results") or []
 
-    # Filter to only those entries that have actually been downloaded
     to_install = [
         entry
         for entry in download_results
@@ -264,7 +252,7 @@ def main() -> None:
     with open(INSTALL_RESULT_PATH, "w", encoding="utf-8") as handle:
         json.dump(install_summary, handle, indent=2)
 
-    print("\n[+] Install results saved to winshield_install_result.json")
+    print(f"\n[+] Install results saved to {INSTALL_RESULT_PATH}")
     print("[*] Installation stage complete.")
     print("    Next steps:")
     print("      1) Run winshield_scanner.py again (via WinShield Master option 1).")

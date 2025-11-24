@@ -5,13 +5,18 @@ import sys
 from datetime import datetime, UTC
 from typing import Dict, List, Set
 
-
 # PowerShell scripts used by the scanner
 BASELINE_SCRIPT = "winshield_baseline.ps1"
 INVENTORY_SCRIPT = "winshield_inventory.ps1"
-MSRC_ADAPTER_SCRIPT = "winshield_adapter.ps1"
+ADAPTER_SCRIPT = "winshield_adapter.ps1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Directory for all JSON result artefacts
+RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+SCAN_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_scan_result.json")
 
 
 def run_powershell_script(script_name: str, extra_args: List[str] | None = None) -> dict:
@@ -146,7 +151,6 @@ def print_kb_table(
     - Months and CVEs are printed over multiple lines when necessary.
     - All CVEs are printed (no truncation).
     """
-    # Index KB entries by KB ID for easier lookup
     kb_index: Dict[str, dict] = {entry["KB"]: entry for entry in kb_entries if "KB" in entry}
 
     header_kb = "KB"
@@ -179,7 +183,6 @@ def print_kb_table(
         else:
             status = "Missing"
 
-        # Ensure we have at least one line for months and CVEs
         if not months_list:
             months_list = [""]
         if not cve_list:
@@ -244,20 +247,20 @@ def main() -> None:
     # MSRC month range: strictly LCU -> current month
     # ------------------------------------------------------------------
     month_ids = build_month_ids_from_lcu(baseline)
-    print(f"[*] Building MSRC month range from LCU to now:")
+    print("[*] Building MSRC month range from LCU to now:")
     print(f"    {', '.join(month_ids)}")
     print()
 
     extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]
-    print("[*] Querying MSRC adapter for aggregated KB data...")
-    msrc_data = run_powershell_script(MSRC_ADAPTER_SCRIPT, extra_args=extra_args)
+    print("[*] Querying adapter for aggregated KB data...")
+    msrc_data = run_powershell_script(ADAPTER_SCRIPT, extra_args=extra_args)
 
     msrc_kb_entries: List[dict] = msrc_data.get("KbEntries") or []
     if not msrc_kb_entries:
-        print("[-] MSRC adapter returned no KB entries for the selected months and product. Nothing to compare.")
+        print("[-] Adapter returned no KB entries for the selected months and product. Nothing to compare.")
         sys.exit(0)
 
-    print(f"[+] MSRC adapter returned {len(msrc_kb_entries)} KB entries for this product.")
+    print(f"[+] Adapter returned {len(msrc_kb_entries)} KB entries for this product.")
     print()
 
     # ------------------------------------------------------------------
@@ -273,9 +276,6 @@ def main() -> None:
 
     expected_security_kbs: Set[str] = {entry["KB"] for entry in msrc_kb_entries if "KB" in entry}
 
-    # Logical presence means:
-    #   - KB is installed, or
-    #   - KB has been superseded by another installed KB (transitively)
     logical_present_kbs: Set[str] = set(installed_kb_set)
 
     changed = True
@@ -295,7 +295,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print()
     print("=== Summary ===")
-    print(f"Total security KBs from MSRC for {product_hint}: {len(expected_security_kbs)}")
+    print(f"Total security KBs from adapter for {product_hint}: {len(expected_security_kbs)}")
     print(f"Installed or superseded (logical present): {len(present_kbs_sorted)}")
     print(f"Missing from MSRC set: {len(missing_kbs_sorted)}")
     print()
@@ -335,12 +335,11 @@ def main() -> None:
         "missing_kbs": missing_kbs_sorted,
     }
 
-    out_path = os.path.join(SCRIPT_DIR, "winshield_scan_result.json")
-    with open(out_path, "w", encoding="utf-8") as handle:
+    with open(SCAN_RESULT_PATH, "w", encoding="utf-8") as handle:
         json.dump(scan_result, handle, indent=2)
 
     print()
-    print(f"[+] Saved detailed scan result to {out_path}")
+    print(f"[+] Saved detailed scan result to {SCAN_RESULT_PATH}")
 
 
 if __name__ == "__main__":

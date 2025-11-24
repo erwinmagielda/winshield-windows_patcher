@@ -1,5 +1,5 @@
-# Local scan outputs
-scans/
+# Local module outputs
+results/
 
 # Downloaded KB packages
 downloads/
