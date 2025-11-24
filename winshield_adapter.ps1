@@ -1,21 +1,43 @@
 <#
 .SYNOPSIS
-    WinShield MSRC adapter (manual arg parser, multi-month safe)
+    WinShield MSRC adapter
 
 .DESCRIPTION
-    - Accepts multiple MonthIds from CLI (Python or manual):
-        winshield_msrc_adapter.ps1 -MonthIds 2025-Nov 2025-Oct ...
-      or:
-        winshield_msrc_adapter.ps1 -MonthIds "2025-Nov,2025-Oct,2025-Sep" ...
-    - Accepts ProductNameHint
-    - Queries MsrcSecurityUpdates for each month
-    - Filters by ProductNameHint
-    - Returns KB list with CVEs and Supersedes as JSON
+    Bridges the MSRC PowerShell module and the Python scanner.
+
+    - Accepts:
+        -MonthIds <list or comma-separated string>
+        -ProductNameHint "<string from baseline>"
+
+    - For each MonthId:
+        * Loads the CVRF document
+        * Extracts affected software rows for the given ProductNameHint
+        * Aggregates KB entries with:
+            - KB ID
+            - Months (list of MonthIds where this KB appears)
+            - Cves  (list of CVE/ADV IDs)
+            - Supersedes (list of KB IDs it supersedes, derived from Supercedence field)
+
+    - Emits a single JSON object to stdout:
+
+        {
+          "ProductName": "<ProductNameHint>",
+          "MonthIds": [ "2023-May", "2023-Jun", ... ],
+          "KbEntries": [
+            {
+              "KB": "KB5026361",
+              "Months": [ "2023-May" ],
+              "Cves": [ "CVE-2023-24900", ... ],
+              "Supersedes": [ "KB5014032", ... ]
+            },
+            ...
+          ]
+        }
 #>
 
-# -------------------------------------------------------------
-# Manual argument parsing to avoid PowerShell param binding quirks
-# -------------------------------------------------------------
+# --------------------------------------------------------------------
+# Manual argument parsing to avoid quoting quirks
+# --------------------------------------------------------------------
 
 $MonthIds = @()
 $ProductNameHint = $null
@@ -24,6 +46,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     switch -Regex ($args[$i]) {
 
         '^-MonthIds$' {
+            # Collect all subsequent non-flag arguments as MonthIds
             $i++
             while ($i -lt $args.Count -and $args[$i] -notmatch '^-') {
                 $MonthIds += $args[$i]
@@ -47,16 +70,15 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 
 if (-not $MonthIds -or -not $ProductNameHint) {
     [pscustomobject]@{
-        Error  = "Usage: winshield_msrc_adapter.ps1 -MonthIds <list> -ProductNameHint <name>"
+        Error   = "Usage: winshield_adapter.ps1 -MonthIds <list> -ProductNameHint <name>"
         RawArgs = $args
     } | ConvertTo-Json -Depth 5
     exit 1
 }
 
-# -------------------------------------------------------------
-# Normalise MonthIds: split on commas, trim, dedupe
-# -------------------------------------------------------------
-
+# Normalise MonthIds:
+#  - Support separate arguments: 2023-May 2023-Jun
+#  - Support comma separated:   "2023-May,2023-Jun"
 $normMonths = @()
 foreach ($m in $MonthIds) {
     if (-not $m) { continue }
@@ -71,10 +93,9 @@ foreach ($m in $MonthIds) {
 
 $MonthIds = $normMonths | Sort-Object -Unique
 
-# -------------------------------------------------------------
+# --------------------------------------------------------------------
 # Load MSRC module
-# -------------------------------------------------------------
-
+# --------------------------------------------------------------------
 try {
     Import-Module -Name MsrcSecurityUpdates -ErrorAction Stop
 } catch {
@@ -85,10 +106,9 @@ try {
     exit 1
 }
 
-# -------------------------------------------------------------
-# Build KB map for all months
-# -------------------------------------------------------------
-
+# --------------------------------------------------------------------
+# Aggregate KB entries across all months
+# --------------------------------------------------------------------
 $kbMap = @{}
 
 foreach ($month in $MonthIds) {
@@ -97,14 +117,17 @@ foreach ($month in $MonthIds) {
         $doc = Get-MsrcCvrfDocument -ID $month -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
     } catch {
+        # If MSRC has no document for the given ID, or retrieval fails, skip this month.
         continue
     }
 
+    # Only rows that match our product hint
     $rows = $aff | Where-Object { $_.FullProductName -like "*$ProductNameHint*" }
     if (-not $rows) { continue }
 
     foreach ($row in $rows) {
 
+        # CVE list normalisation
         $cveList = @()
         if ($row.CVE) {
             if ($row.CVE -is [System.Collections.IEnumerable] -and -not ($row.CVE -is [string])) {
@@ -114,6 +137,7 @@ foreach ($month in $MonthIds) {
             }
         }
 
+        # Supersedence normalisation
         $supers = @()
         if ($row.Supercedence) {
             foreach ($s in $row.Supercedence) {
@@ -126,6 +150,7 @@ foreach ($month in $MonthIds) {
             }
         }
 
+        # KB Article processing
         if ($row.KBArticle) {
             foreach ($kbObj in $row.KBArticle) {
                 if (-not $kbObj.ID) { continue }
@@ -141,16 +166,19 @@ foreach ($month in $MonthIds) {
                     }
                 }
 
+                # Track all months where this KB appears
                 if ($kbMap[$kb].Months -notcontains $month) {
                     $kbMap[$kb].Months += $month
                 }
 
+                # Aggregate CVEs
                 foreach ($c in $cveList) {
                     if ($kbMap[$kb].Cves -notcontains $c) {
                         $kbMap[$kb].Cves += $c
                     }
                 }
 
+                # Aggregate superseded KBs
                 foreach ($s in $supers) {
                     if ($kbMap[$kb].Supersedes -notcontains $s) {
                         $kbMap[$kb].Supersedes += $s

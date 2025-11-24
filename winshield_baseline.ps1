@@ -1,13 +1,20 @@
 <#
 .SYNOPSIS
-    WinShield Baseline Generator (de-hardcoded)
+    WinShield Baseline Generator
 
 .DESCRIPTION
-    Detects OS name, version, build, arch, latest LCU (if run as admin),
-    and automatically discovers the correct MSRC ProductNameHint via the
-    official MsrcSecurityUpdates module.
+    Collects local system baseline information for WinShield:
 
-    Outputs JSON to stdout for the Python scanner.
+    - OS name, edition, version, build, architecture
+    - Whether the script was run as Administrator
+    - Latest installed cumulative update (LCU):
+        * Package name (from Get-WindowsPackage)
+        * Install time
+        * Derived MonthId (yyyy-MMM)
+        * Parsed KB number, if present
+    - MSRC ProductNameHint for the current month
+
+    The result is emitted as JSON to stdout for winshield_scanner.py.
 #>
 
 function Import-MsrcModule {
@@ -22,51 +29,52 @@ function Import-MsrcModule {
 function Get-WinShieldProductNameHint {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$MonthId  # e.g. "2025-Nov"
+        [string]$MonthId  # for example: "2025-Nov"
     )
 
     try {
         Import-MsrcModule
 
-        # Detect current OS
+        # Detect current OS identity for product matching
         $os = Get-CimInstance Win32_OperatingSystem
-        $osFullName = $os.Caption
-        $osArchRaw  = $os.OSArchitecture
+        $osFullName = $os.Caption                # eg "Microsoft Windows 11 Home"
+        $osArchRaw  = $os.OSArchitecture         # eg "64-bit"
         $arch       = if ($osArchRaw -match "64") { "x64" } else { "x86" }
 
-        # Normalise family: "Windows 11" or "Windows 10" etc.
+        # Normalise family name
         $osFamily = $null
         if ($osFullName -like "*Windows 11*") {
             $osFamily = "Windows 11"
         } elseif ($osFullName -like "*Windows 10*") {
             $osFamily = "Windows 10"
         } else {
+            # Remove "Microsoft " prefix as a generic fallback
             $osFamily = ($osFullName -replace '^Microsoft\s+', '')
         }
 
-        # Get display version (22H2, 23H2, 25H2, etc.) from registry
+        # Determine Windows display version (eg 22H2, 23H2, 25H2)
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
         $displayVersion = $cv.DisplayVersion
         if (-not $displayVersion) {
             $displayVersion = $cv.ReleaseId
         }
 
-        # Query MSRC for this month
+        # Query MSRC CVRF document for this month
         $doc = Get-MsrcCvrfDocument -ID $MonthId -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
 
-        # Unique product names
+        # Full product name candidates
         $names = $aff | Select-Object -ExpandProperty FullProductName -Unique
 
-        # 1) candidates for this OS family + arch
+        # Step 1: best match for OS family + architecture
         $candidates = $names |
             Where-Object { $_ -like "$osFamily*for *$arch-based Systems*" } |
             Sort-Object
 
-        # 2) if we know a displayVersion like "22H2", prefer that
+        # Step 2: refine with display version if available
         if ($displayVersion) {
-            $versionToken1 = $displayVersion
-            $versionToken2 = "Version $displayVersion"
+            $versionToken1 = $displayVersion               # "22H2"
+            $versionToken2 = "Version $displayVersion"     # "Version 22H2"
 
             $candidatesForVersion = $candidates |
                 Where-Object {
@@ -79,20 +87,21 @@ function Get-WinShieldProductNameHint {
             }
         }
 
-        # 3) Fallback: if still nothing, use all names that start with family
+        # Step 3: fallback based on family prefix only
         if (-not $candidates -and $osFamily) {
             $candidates = $names |
                 Where-Object { $_ -like "$osFamily*" } |
                 Sort-Object
         }
 
+        # Step 4: final fallback based on "Windows*for *arch-based Systems*"
         if (-not $candidates) {
             $candidates = $names |
                 Where-Object { $_ -like "Windows*for *$arch-based Systems*" } |
                 Sort-Object
         }
 
-        # Prefer entries with "Version", pick the last (newest)
+        # Prefer entries containing the word "Version", then take the newest (sorted lexicographically)
         $best = $candidates |
             Where-Object { $_ -like "*Version*" } |
             Sort-Object |
@@ -111,7 +120,7 @@ function Get-WinShieldProductNameHint {
 }
 
 # -------------------------------------------------------------------------
-# Detect system info
+# Local system information
 # -------------------------------------------------------------------------
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $os = Get-CimInstance Win32_OperatingSystem
@@ -131,7 +140,7 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     default { $env:PROCESSOR_ARCHITECTURE }
 }
 
-# Admin check
+# Determine whether the script is running with administrative privileges
 $windowsIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($windowsIdentity)
 $isAdmin          = $windowsPrincipal.IsInRole(
@@ -139,27 +148,29 @@ $isAdmin          = $windowsPrincipal.IsInRole(
 )
 
 if (-not $isAdmin) {
-    Write-Warning "WinShield baseline is not running as Administrator. LCU_PackageName, LCU_InstallTime and LCU_MonthId will be null because Get-WindowsPackage requires elevation."
+    Write-Warning "WinShield baseline is not running as Administrator. LCU fields (LCU_PackageName, LCU_InstallTime, LCU_MonthId, LCU_KB) will be null because Get-WindowsPackage requires elevation."
 }
 
 # -------------------------------------------------------------------------
-# Detect latest LCU (if admin)
+# Detect latest installed cumulative update (LCU) when running as admin
 # -------------------------------------------------------------------------
 $lcuPkgName = $null
 $lcuTime    = $null
+$lcuKbId    = $null
 
 if ($isAdmin) {
     try {
+        # Retrieve all packages and order them by install time (newest first)
         $allPkgs = Get-WindowsPackage -Online
 
-        # Prefer RollupFix
-        $rollups = $allPkgs |
+        # Primary filter: traditional RollupFix naming
+        $rollupCandidates = $allPkgs |
             Where-Object { $_.PackageName -like "*RollupFix*" } |
             Sort-Object InstallTime -Descending
 
-        if (-not $rollups -or $rollups.Count -eq 0) {
-            # fallback: Description / PackageName (if MS changes naming)
-            $rollups = $allPkgs |
+        # Secondary filter: text hints if RollupFix is not present on some builds
+        if (-not $rollupCandidates -or $rollupCandidates.Count -eq 0) {
+            $rollupCandidates = $allPkgs |
                 Where-Object {
                     ($_.Description -like "*Cumulative Update*" -or $_.Description -like "*LCU*") -or
                     ($_.PackageName -like "*Cumulative Update*" -or $_.PackageName -like "*LCU*")
@@ -167,20 +178,27 @@ if ($isAdmin) {
                 Sort-Object InstallTime -Descending
         }
 
-        if ($rollups -and $rollups.Count -gt 0) {
-            $lcu = $rollups[0]
+        if ($rollupCandidates -and $rollupCandidates.Count -gt 0) {
+            $lcu = $rollupCandidates[0]
             $lcuPkgName = $lcu.PackageName
             $lcuTime    = $lcu.InstallTime
-        } else {
-            Write-Error "Could not identify LCU package. Adjust filters in winshield_baseline.ps1."
+
+            # Attempt to extract the KB number from the description or package name
+            $kbSource = "$($lcu.Description) $($lcu.PackageName)"
+            if ($kbSource -match 'KB(\d{4,7})') {
+                $lcuKbId = "KB$($Matches[1])"
+            }
+        }
+        else {
+            Write-Error "WinShield baseline: could not identify LCU package from Get-WindowsPackage. Filters may need adjustment."
         }
     }
     catch {
-        Write-Error "Failed to query LCU via Get-WindowsPackage: $($_.Exception.Message)"
+        Write-Error "WinShield baseline: Get-WindowsPackage failed: $($_.Exception.Message)"
     }
 }
 
-# Derive LCU month id for scanner
+# Convert LCU install time to yyyy-MMM month identifier
 $lcuMonthId = $null
 if ($lcuTime) {
     $lcuMonthId = (Get-Date $lcuTime).ToString("yyyy-MMM")
@@ -189,7 +207,7 @@ if ($lcuTime) {
 # -------------------------------------------------------------------------
 # Auto-detect MSRC ProductNameHint for current month
 # -------------------------------------------------------------------------
-$monthId = (Get-Date).ToString("yyyy-MMM")
+$monthId     = (Get-Date).ToString("yyyy-MMM")
 $productHint = Get-WinShieldProductNameHint -MonthId $monthId
 
 # -------------------------------------------------------------------------
@@ -208,7 +226,14 @@ $baseline = [pscustomobject]@{
     LCU_PackageName = $lcuPkgName
     LCU_InstallTime = $lcuTime
     LCU_MonthId     = $lcuMonthId
+    LCU_KB          = $lcuKbId
     ProductNameHint = $productHint
+    LatestLCU       = [pscustomobject]@{
+        KB          = $lcuKbId
+        PackageName = $lcuPkgName
+        InstallTime = $lcuTime
+        MonthId     = $lcuMonthId
+    }
 }
 
 $baseline | ConvertTo-Json -Depth 4

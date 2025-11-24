@@ -1,13 +1,17 @@
-# winshield_downloader.py
 """
-WinShield Downloader (Download-only, JSON summary)
+WinShield Downloader (download-only, JSON summary)
 
-- Loads winshield_scan_result.json (from winshield_scanner.py)
+- Loads winshield_scan_result.json produced by winshield_scanner.py.
 - For each missing KB:
-      → Resolve Microsoft Update Catalog download URL
-      → Download .msu/.cab file into ./downloads/
-      → Mark as Downloaded / Unavailable / Failed
-- Saves: winshield_download_result.json
+      → Resolve Microsoft Update Catalog download URL.
+      → Download .msu/.cab file into ./downloads/.
+      → Record status: Downloaded / Unavailable / Failed.
+- Writes winshield_download_result.json with a detailed summary.
+
+Future extension:
+- Present missing KBs with numeric IDs.
+- Allow the user to select subsets and ranges (eg "1-3,5,7").
+- Integrate simple type hints (LCU-like vs other) once classification is in place.
 """
 
 import json
@@ -29,11 +33,12 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
 
 def http_get(url: str, params: Dict[str, str] | None = None, timeout: int = 30) -> Optional[requests.Response]:
+    """
+    Perform an HTTP GET with a fixed User-Agent and optional query parameters.
+    Returns the Response object or None when the request fails.
+    """
     try:
         return requests.get(
             url,
@@ -47,6 +52,10 @@ def http_get(url: str, params: Dict[str, str] | None = None, timeout: int = 30) 
 
 
 def http_post_form(url: str, body: Dict[str, str], timeout: int = 30) -> Optional[requests.Response]:
+    """
+    Perform an HTTP POST with form-encoded data.
+    Returns the Response object or None when the request fails.
+    """
     try:
         return requests.post(
             url,
@@ -61,65 +70,82 @@ def http_post_form(url: str, body: Dict[str, str], timeout: int = 30) -> Optiona
         print(f"[!] HTTP POST failed for {url}: {exc}")
         return None
 
-# ---------------------------------------------------------------------------
-# Catalog scraping
-# ---------------------------------------------------------------------------
 
-def extract_guids(html: str) -> list[str]:
-    """Extract GUIDs from the catalog search page."""
+def extract_guids(html: str) -> List[str]:
+    """
+    Extract GUIDs from the Microsoft Update Catalog search results page.
+
+    The GUID format is:
+      8-4-4-4-12 hex digits, eg: 01234567-89ab-cdef-0123-456789abcdef
+    """
     guids = re.findall(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         html,
     )
-    seen = set()
-    out: list[str] = []
-    for g in guids:
-        if g not in seen:
-            seen.add(g)
-            out.append(g)
-    return out
+    unique: List[str] = []
+    seen: set[str] = set()
+    for guid in guids:
+        if guid not in seen:
+            seen.add(guid)
+            unique.append(guid)
+    return unique
 
 
 def post_download_dialog(guid: str) -> Optional[str]:
-    """POST to DownloadDialog.aspx → return HTML if it looks valid."""
+    """
+    Call the DownloadDialog.aspx endpoint for a specific catalog GUID and return the HTML.
+
+    The HTML is expected to contain the "downloadInformation" data structure.
+    """
     url = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
     payload = {
         "updateIDs": f'[{{"size":0,"updateID":"{guid}","uidInfo":"{guid}"}}]'
     }
 
-    r = http_post_form(url, payload)
-    if not r or r.status_code != 200:
+    response = http_post_form(url, payload)
+    if not response or response.status_code != 200:
         return None
 
-    html = r.text
+    html = response.text
     if "downloadInformation" not in html:
         return None
 
     return html
 
 
-def choose_file_url(dialog_html: str, kb: str, bitness: str) -> Optional[str]:
-    """Pick the best .msu/.cab URL from DownloadDialog markup."""
+def choose_file_url(dialog_html: str, kb_digits: str, bitness: str) -> Optional[str]:
+    """
+    Select the best candidate MSU or CAB file URL from the DownloadDialog markup.
+
+    The scoring favours:
+      - URLs containing the KB token (eg "kb5026361")
+      - URLs matching architecture (x64 vs x86)
+      - MSU files over CAB when multiple are present
+    """
     urls = re.findall(
         r"downloadInformation\[\d+\]\.files\[\d+\]\.url\s*=\s*'([^']+)'",
         dialog_html,
     )
 
     if not urls:
-        urls = re.findall(r'(https?://[^\s"]+\.(?:cab|msu))', dialog_html, flags=re.IGNORECASE)
+        urls = re.findall(
+            r'(https?://[^\s"]+\.(?:cab|msu))',
+            dialog_html,
+            flags=re.IGNORECASE,
+        )
 
     if not urls:
         return None
 
-    kb_token = f"kb{kb}".lower()
+    kb_token = f"kb{kb_digits}".lower()
     arch_token = "x64" if "64" in bitness else "x86"
 
-    def score(u: str):
-        u_low = u.lower()
+    def score(url: str) -> tuple[int, int, int]:
+        lower = url.lower()
         return (
-            1 if kb_token in u_low else 0,
-            1 if arch_token in u_low else 0,
-            2 if u_low.endswith(".msu") else 1,
+            1 if kb_token in lower else 0,
+            1 if arch_token in lower else 0,
+            2 if lower.endswith(".msu") else 1,
         )
 
     return max(urls, key=score)
@@ -127,16 +153,23 @@ def choose_file_url(dialog_html: str, kb: str, bitness: str) -> Optional[str]:
 
 def resolve_download_for_kb(kb_digits: str, os_name: str, build: str, bitness: str) -> Optional[str]:
     """
-    Search Microsoft Update Catalog → extract GUIDs → POST dialogs → select a file URL.
-    kb_digits: just the numeric part, e.g. "5068861".
+    Resolve a Microsoft Update Catalog download URL for a given KB number.
+
+    Steps:
+      - Submit a catalog search for "KB<digits>".
+      - Extract candidate GUIDs from the result page.
+      - Query each GUID's DownloadDialog.aspx endpoint.
+      - Select the best matching file URL from the dialog HTML.
+
+    Returns the URL string or None when resolution fails.
     """
     search_url = "https://www.catalog.update.microsoft.com/Search.aspx"
-    r = http_get(search_url, params={"q": f"KB{kb_digits}"})
-    if not r or r.status_code != 200:
-        print(f"[!] Catalog search for KB{kb_digits} failed (HTTP {getattr(r, 'status_code', '???')})")
+    response = http_get(search_url, params={"q": f"KB{kb_digits}"})
+    if not response or response.status_code != 200:
+        print(f"[!] Catalog search for KB{kb_digits} failed (HTTP {getattr(response, 'status_code', '???')})")
         return None
 
-    page_html = r.text
+    page_html = response.text
     guids = extract_guids(page_html)
 
     if not guids:
@@ -144,62 +177,62 @@ def resolve_download_for_kb(kb_digits: str, os_name: str, build: str, bitness: s
         return None
 
     for guid in guids:
-        dialog = post_download_dialog(guid)
-        if not dialog:
+        dialog_html = post_download_dialog(guid)
+        if not dialog_html:
             continue
 
-        url = choose_file_url(dialog, kb_digits, bitness)
+        url = choose_file_url(dialog_html, kb_digits, bitness)
         if url:
             return url
 
     return None
 
-# ---------------------------------------------------------------------------
-# Download helper
-# ---------------------------------------------------------------------------
 
 def download_file(url: str, dest: str) -> Optional[int]:
+    """
+    Download a file from the given URL to the destination path.
+
+    The download is streamed in 1 MB chunks to limit memory usage.
+    Returns the number of bytes written, or None when the download fails.
+    """
     try:
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
+        with requests.get(url, stream=True, timeout=120) as response:
+            response.raise_for_status()
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            total = 0
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
+            total_bytes = 0
+            with open(dest, "wb") as handle:
+                for chunk in response.iter_content(1024 * 1024):
                     if chunk:
-                        f.write(chunk)
-                        total += len(chunk)
-        return total
+                        handle.write(chunk)
+                        total_bytes += len(chunk)
+        return total_bytes
     except Exception as exc:
-        print(f"[!] Download failed: {exc}")
+        print(f"[!] Download failed for {url}: {exc}")
         return None
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     if not os.path.isfile(SCAN_RESULT_PATH):
-        print("[X] winshield_scan_result.json not found. Run scanner first.")
+        print("[X] winshield_scan_result.json not found. Run winshield_scanner.py first.")
         sys.exit(1)
 
-    with open(SCAN_RESULT_PATH, "r", encoding="utf-8") as f:
-        scan = json.load(f)
+    with open(SCAN_RESULT_PATH, "r", encoding="utf-8") as handle:
+        scan = json.load(handle)
 
     baseline = scan.get("baseline") or {}
     missing_kbs: List[str] = scan.get("missing_kbs") or []
 
     if not missing_kbs:
-        print("[+] No missing KBs — system is up to date.")
+        print("[+] No missing KBs according to the last WinShield scan. System is up to date for the scanned MSRC window.")
         return
 
     os_name = baseline.get("OSName", "Unknown Windows")
     build = str(baseline.get("Build") or baseline.get("FullBuild") or "0")
-    arch = baseline.get("Architecture", "x64")
-    bitness = "64" if "64" in arch else "32"
+    architecture = baseline.get("Architecture", "x64")
+    bitness = "64" if "64" in architecture else "32"
 
-    print(f"[*] OS: {os_name} | Build: {build} | Arch: {arch}")
-    print(f"[*] Missing KBs: {', '.join(missing_kbs)}")
+    print(f"[*] OS: {os_name} | Build: {build} | Architecture: {architecture}")
+    print(f"[*] Missing KBs reported by scanner: {', '.join(missing_kbs)}")
     print("============================================================")
 
     results: List[Dict[str, Any]] = []
@@ -208,7 +241,7 @@ def main():
         kb_digits = re.sub(r"[^0-9]", "", kb)
 
         if not kb_digits:
-            print(f"[!] Cannot extract digits from {kb}, marking Unavailable.")
+            print(f"[!] Cannot extract digits from {kb}, marking as Unavailable.")
             results.append(
                 {
                     "kb": kb,
@@ -222,11 +255,11 @@ def main():
             )
             continue
 
-        print(f"\n[*] Resolving Catalog for {kb} ...")
+        print(f"\n[*] Resolving Microsoft Update Catalog entry for {kb} ...")
         url = resolve_download_for_kb(kb_digits, os_name, build, bitness)
 
         if not url:
-            print(f"[!] KB{kb_digits}: No valid Catalog URL. Marking Unavailable.")
+            print(f"[!] KB{kb_digits}: No valid catalog URL found. Marking as Unavailable.")
             results.append(
                 {
                     "kb": kb,
@@ -243,11 +276,11 @@ def main():
         filename = os.path.basename(url.split("?", 1)[0])
         dest_path = os.path.join(DOWNLOADS_DIR, f"{kb}_{filename}")
 
-        print(f"[+] Downloading {filename} ...")
-        size = download_file(url, dest_path)
+        print(f"[+] Downloading {filename} to {dest_path} ...")
+        size_bytes = download_file(url, dest_path)
 
-        if size is not None:
-            size_mb = size / (1024 * 1024)
+        if size_bytes is not None:
+            size_mb = size_bytes / (1024 * 1024)
             print(f"[+] Saved {size_mb:.1f} MB to {dest_path}")
             results.append(
                 {
@@ -257,7 +290,7 @@ def main():
                     "reason": None,
                     "url": url,
                     "local_path": dest_path,
-                    "size_bytes": size,
+                    "size_bytes": size_bytes,
                 }
             )
         else:
@@ -267,7 +300,7 @@ def main():
                     "kb": kb,
                     "digits": kb_digits,
                     "status": "Failed",
-                    "reason": "HTTP / IO error",
+                    "reason": "HTTP or I/O error",
                     "url": url,
                     "local_path": dest_path,
                     "size_bytes": None,
@@ -278,14 +311,14 @@ def main():
         "baseline": {
             "OSName": os_name,
             "Build": build,
-            "Architecture": arch,
+            "Architecture": architecture,
         },
         "missing_kbs": missing_kbs,
         "results": results,
     }
 
-    with open(DOWNLOAD_RESULT_PATH, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    with open(DOWNLOAD_RESULT_PATH, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
     print("\n[+] Download results saved to winshield_download_result.json")
     print("[*] Download-only run complete.")
