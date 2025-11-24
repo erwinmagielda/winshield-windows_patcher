@@ -350,10 +350,5 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[X] Fatal error: {exc}")
         exit_code = 1
-    finally:
-        try:
-            input("\nPress Enter to close this window...")
-        except EOFError:
-            # When scanner is launched from another script without a console
-            pass
-        sys.exit(exit_code)
+
+    sys.exit(exit_code)
