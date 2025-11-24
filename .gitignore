@@ -1,27 +1,8 @@
-# Python cache / temp
-__pycache__/
-*.pyc
-*.pyo
-
-# PowerShell compiled artifacts
-*.ps1xml
-
 # Local scan outputs
-winshield_scan_result.json
-winshield_catalog_status.json
-winshield_download_resuts.json
-winshield_scan_before_install.json
-winshield_verify_results.json
+scans/
 
 # Downloaded KB packages
 downloads/
-
-# Logs
-*.log
-
-# IDE clutter
-.vscode/
-.idea/
 
 # Personal notes
 notes.txt
