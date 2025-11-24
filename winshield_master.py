@@ -49,13 +49,13 @@ def main():
     while True:
         print("""
 ===========================================
-             WinShield Master
+                 WinShield
 ===========================================
 
-1) Run system scan
-2) Download missing KBs
-3) Install downloaded KBs
-4) Verify installation (compare before vs after)
+1) Run Scan
+2) Download KBs
+3) Install KBs
+4) Verify Install
 5) Exit
 
 ===========================================
@@ -76,7 +76,7 @@ def main():
             run_module(MODULE_VERIFIER)
 
         elif choice == "5":
-            print("Exiting WinShield Master...")
+            print("Exiting WinShield...")
             return
 
         else:
