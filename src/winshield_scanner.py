@@ -11,9 +11,10 @@ INVENTORY_SCRIPT = "winshield_inventory.ps1"
 ADAPTER_SCRIPT = "winshield_adapter.ps1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
-# Directory for all JSON result artefacts
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+# Directory for all JSON result artefacts (at repo root)
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 SCAN_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_scan_result.json")

@@ -6,3 +6,9 @@ downloads/
 
 # Personal notes
 notes.txt
+
+# Python dependencies
+requirements.txt
+
+# Python cache
+__pycache__/

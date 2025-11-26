@@ -24,11 +24,12 @@ from typing import Optional, Dict, Any, List
 import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
-DOWNLOADS_DIR = os.path.join(SCRIPT_DIR, "downloads")
+DOWNLOADS_DIR = os.path.join(ROOT_DIR, "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 SCAN_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_scan_result.json")

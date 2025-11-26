@@ -23,8 +23,9 @@ import sys
 from typing import Any, Dict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 SCAN_BEFORE_PATH = os.path.join(RESULTS_DIR, "winshield_scan_before_install.json")

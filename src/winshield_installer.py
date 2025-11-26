@@ -23,8 +23,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 DOWNLOAD_RESULT_PATH = os.path.join(RESULTS_DIR, "winshield_download_result.json")

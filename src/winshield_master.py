@@ -18,7 +18,7 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-PYTHON = sys.executable  # current python interpreter
+PYTHON = sys.executable
 
 MODULE_SCANNER = os.path.join(SCRIPT_DIR, "winshield_scanner.py")
 MODULE_DOWNLOADER = os.path.join(SCRIPT_DIR, "winshield_downloader.py")
