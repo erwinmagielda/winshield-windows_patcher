@@ -1,14 +1,14 @@
+# Local notes
+notes.txt
+
+# Python dependencies
+dependencies.txt
+
 # Local module outputs
 results/
 
 # Downloaded KB packages
 downloads/
-
-# Personal notes
-notes.txt
-
-# Python dependencies
-requirements.txt
 
 # Python cache
 __pycache__/
