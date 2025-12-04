@@ -75,16 +75,10 @@ def build_month_ids_from_lcu(
     """
     Build a chronological list of month identifiers starting from the LCU month.
 
-    The list is inclusive of the LCU month and continues forward until the current
-    calendar month (UTC), or until max_months is reached.
-
-    Requirements:
-      - Baseline must indicate that it was collected as Administrator.
-      - Baseline must contain a valid LCU_MonthId in 'YYYY-MMM' format.
-
-    :param baseline: Baseline dictionary produced by winshield_baseline.ps1.
-    :param max_months: Safety limit for the number of months to include.
-    :return: A list of month identifiers in 'YYYY-MMM' format.
+    The list is inclusive of the LCU month and continues forward until:
+      - the current calendar month (UTC), or
+      - the latest MSRC ID known to the module (if earlier),
+      - or until max_months is reached.
     """
     if not baseline.get("IsAdmin"):
         raise RuntimeError(
@@ -111,10 +105,27 @@ def build_month_ids_from_lcu(
             "Fix LCU_MonthId formatting in winshield_baseline.ps1."
         ) from exc
 
-    if start > now:
+    # Optional clamp: latest MSRC ID known to the module
+    msrc_latest_id = baseline.get("MsrcLatestId")
+    end = now
+
+    if msrc_latest_id:
+        try:
+            msrc_latest_dt = datetime.strptime(msrc_latest_id, "%Y-%b").replace(day=1, tzinfo=UTC)
+            if msrc_latest_dt < end:
+                end = msrc_latest_dt
+        except ValueError:
+            # If parsing fails, ignore clamp and keep 'now' as end
+            pass
+
+    # If LCU month is later than the clamp, start from the clamp
+    if start > end:
+        start = end
+
+    if start > end:
         raise RuntimeError(
-            f"LCU_MonthId '{lcu_month_id}' is in the future compared to the current month.\n"
-            "This is likely a bug in winshield_baseline.ps1 LCU handling."
+            f"LCU_MonthId '{lcu_month_id}' resolves to a start date after the effective end date.\n"
+            "Check MsrcLatestId and LCU_MonthId values in the baseline."
         )
 
     year = start.year
@@ -123,12 +134,12 @@ def build_month_ids_from_lcu(
 
     while True:
         current = datetime(year, month, 1, tzinfo=UTC)
-        if current > now:
+        if current > end:
             break
 
         month_ids.append(current.strftime("%Y-%b"))
 
-        if current == now or len(month_ids) >= max_months:
+        if current == end or len(month_ids) >= max_months:
             break
 
         month += 1
@@ -244,12 +255,31 @@ def main() -> None:
     print(f"[+] Installed KBs ({len(installed_kb_set)}): {', '.join(sorted(installed_kb_set))}")
     print()
 
-    # ------------------------------------------------------------------
-    # MSRC month range: strictly LCU -> current month
+# ------------------------------------------------------------------
+    # MSRC month range: strictly LCU -> current month, clamped to latest MSRC ID
     # ------------------------------------------------------------------
     month_ids = build_month_ids_from_lcu(baseline)
+
     print("[*] Building MSRC month range from LCU to now:")
-    print(f"    {', '.join(month_ids)}")
+
+    lcu_month_id = baseline.get("LCU_MonthId")
+    msrc_latest_id = baseline.get("MsrcLatestId")
+
+    if msrc_latest_id and lcu_month_id and lcu_month_id != msrc_latest_id:
+        # If LCU month is not equal to latest MSRC ID and the range ends at latest MSRC,
+        # tell the user we are clamping.
+        if month_ids and month_ids[-1] == msrc_latest_id:
+            print(f"    {', '.join(month_ids)}")
+            print(
+                f"[!] MSRC module latest bulletin is {msrc_latest_id} "
+                f"while LCU month is {lcu_month_id}. "
+                f"Clamping scan window to {msrc_latest_id} until a newer MSRC ID is available."
+            )
+        else:
+            print(f"    {', '.join(month_ids)}")
+    else:
+        print(f"    {', '.join(month_ids)}")
+
     print()
 
     extra_args = ["-MonthIds", *month_ids, "-ProductNameHint", product_hint]

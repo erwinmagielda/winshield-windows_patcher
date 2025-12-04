@@ -26,6 +26,72 @@ function Import-MsrcModule {
     }
 }
 
+function Get-WinShieldLatestMsrcId {
+    try {
+        Import-MsrcModule
+
+        $cmd = Get-Command Get-MsrcCvrfDocument -ErrorAction Stop
+        $idParam = $cmd.Parameters['ID']
+        $validIds = @()
+
+        if ($idParam) {
+            foreach ($attr in $idParam.Attributes) {
+                if ($attr -is [System.Management.Automation.ValidateSetAttribute]) {
+                    $validIds = $attr.ValidValues
+                    break
+                }
+            }
+        }
+
+        if (-not $validIds -or $validIds.Count -eq 0) {
+            return $null
+        }
+
+        # Parse valid IDs as dates and pick the latest
+        $parsedList = @()
+
+        foreach ($id in $validIds) {
+            if (-not $id) { continue }
+            $trimId = $id.Trim()
+
+            $parsed = $null
+            try {
+                $parsed = [datetime]::ParseExact(
+                    $trimId,
+                    'yyyy-MMM',
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+            } catch {
+                try {
+                    $parsed = [datetime]::ParseExact(
+                        $trimId,
+                        'yyyy-MMM',
+                        [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+                    )
+                } catch {
+                    $parsed = $null
+                }
+            }
+
+            if ($parsed) {
+                $parsedList += [pscustomobject]@{
+                    Id   = $trimId
+                    Date = $parsed
+                }
+            }
+        }
+
+        if ($parsedList.Count -eq 0) {
+            return $null
+        }
+
+        return ($parsedList | Sort-Object Date | Select-Object -Last 1).Id
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-WinShieldProductNameHint {
     param(
         [Parameter(Mandatory = $true)]
@@ -35,7 +101,130 @@ function Get-WinShieldProductNameHint {
     try {
         Import-MsrcModule
 
+        # -------------------------------------------------------------
+        # Resolve the most appropriate MSRC ID based on the module ValidateSet
+        # -------------------------------------------------------------
+        $effectiveMonthId = $MonthId
+
+        try {
+            $cmd = Get-Command Get-MsrcCvrfDocument -ErrorAction Stop
+            $idParam = $cmd.Parameters['ID']
+            $validIds = @()
+
+            if ($idParam) {
+                foreach ($attr in $idParam.Attributes) {
+                    if ($attr -is [System.Management.Automation.ValidateSetAttribute]) {
+                        $validIds = $attr.ValidValues
+                        break
+                    }
+                }
+            }
+
+            if ($validIds -and $validIds -notcontains $MonthId) {
+
+                # Parse requested MonthId as a DateTime
+                $requestedDate = $null
+                try {
+                    $requestedDate = [datetime]::ParseExact(
+                        $MonthId,
+                        'yyyy-MMM',
+                        [System.Globalization.CultureInfo]::InvariantCulture
+                    )
+                } catch {
+                    # If parsing fails, leave requestedDate as null
+                }
+
+                if ($requestedDate) {
+                    $candidates = @()
+
+                    foreach ($id in $validIds) {
+                        if (-not $id) { continue }
+                        $trimId = $id.Trim()
+
+                        $parsed = $null
+                        try {
+                            $parsed = [datetime]::ParseExact(
+                                $trimId,
+                                'yyyy-MMM',
+                                [System.Globalization.CultureInfo]::InvariantCulture
+                            )
+                        } catch {
+                            # Handle odd cases like 2018-FEB
+                            try {
+                                $parsed = [datetime]::ParseExact(
+                                    $trimId,
+                                    'yyyy-MMM',
+                                    [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+                                )
+                            } catch {
+                                $parsed = $null
+                            }
+                        }
+
+                        if ($parsed -and $parsed -le $requestedDate) {
+                            $candidates += [pscustomobject]@{
+                                Id   = $trimId
+                                Date = $parsed
+                            }
+                        }
+                    }
+
+                    if ($candidates.Count -gt 0) {
+                        # Latest valid ID not later than the requested MonthId
+                        $effectiveMonthId = ($candidates | Sort-Object Date | Select-Object -Last 1).Id
+                    }
+                    else {
+                        # No ID on or before requested date, fall back to latest known ID
+                        $allParsed = @()
+
+                        foreach ($id in $validIds) {
+                            if (-not $id) { continue }
+                            $trimId = $id.Trim()
+
+                            $parsed = $null
+                            try {
+                                $parsed = [datetime]::ParseExact(
+                                    $trimId,
+                                    'yyyy-MMM',
+                                    [System.Globalization.CultureInfo]::InvariantCulture
+                                )
+                            } catch {
+                                try {
+                                    $parsed = [datetime]::ParseExact(
+                                        $trimId,
+                                        'yyyy-MMM',
+                                        [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+                                    )
+                                } catch {
+                                    $parsed = $null
+                                }
+                            }
+
+                            if ($parsed) {
+                                $allParsed += [pscustomobject]@{
+                                    Id   = $trimId
+                                    Date = $parsed
+                                }
+                            }
+                        }
+
+                        if ($allParsed.Count -gt 0) {
+                            $effectiveMonthId = ($allParsed | Sort-Object Date | Select-Object -Last 1).Id
+                        }
+                    }
+                }
+            }
+        } catch {
+            # If anything goes wrong while resolving IDs, keep the original MonthId
+        }
+
+        if ($effectiveMonthId -ne $MonthId) {
+            Write-Verbose "WinShield: MonthId '$MonthId' not valid in MSRC module. Using '$effectiveMonthId' for ProductNameHint."
+        }
+
+        # -------------------------------------------------------------
         # Detect current OS identity for product matching
+        # -------------------------------------------------------------
         $os = Get-CimInstance Win32_OperatingSystem
         $osFullName = $os.Caption                # eg "Microsoft Windows 11 Home"
         $osArchRaw  = $os.OSArchitecture         # eg "64-bit"
@@ -48,7 +237,6 @@ function Get-WinShieldProductNameHint {
         } elseif ($osFullName -like "*Windows 10*") {
             $osFamily = "Windows 10"
         } else {
-            # Remove "Microsoft " prefix as a generic fallback
             $osFamily = ($osFullName -replace '^Microsoft\s+', '')
         }
 
@@ -59,8 +247,10 @@ function Get-WinShieldProductNameHint {
             $displayVersion = $cv.ReleaseId
         }
 
-        # Query MSRC CVRF document for this month
-        $doc = Get-MsrcCvrfDocument -ID $MonthId -ErrorAction Stop
+        # -------------------------------------------------------------
+        # Query MSRC CVRF document for the chosen month
+        # -------------------------------------------------------------
+        $doc = Get-MsrcCvrfDocument -ID $effectiveMonthId -ErrorAction Stop
         $aff = Get-MsrcCvrfAffectedSoftware -Vulnerability $doc.Vulnerability -ProductTree $doc.ProductTree
 
         # Full product name candidates
@@ -209,6 +399,8 @@ if ($lcuTime) {
 # -------------------------------------------------------------------------
 $monthId     = (Get-Date).ToString("yyyy-MMM")
 $productHint = Get-WinShieldProductNameHint -MonthId $monthId
+# Discover the latest MSRC ID known to the module (for scanner clamping)
+$msrcLatestId = Get-WinShieldLatestMsrcId
 
 # -------------------------------------------------------------------------
 # Build final baseline object
@@ -228,6 +420,7 @@ $baseline = [pscustomobject]@{
     LCU_MonthId     = $lcuMonthId
     LCU_KB          = $lcuKbId
     ProductNameHint = $productHint
+    MsrcLatestId    = $msrcLatestId 
     LatestLCU       = [pscustomobject]@{
         KB          = $lcuKbId
         PackageName = $lcuPkgName
