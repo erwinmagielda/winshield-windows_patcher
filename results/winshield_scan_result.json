@@ -14,7 +14,6 @@
   },
   "InstalledKbs": [
     "KB5054156",
-    "KB5067931",
     "KB5071142",
     "KB5074104",
     "KB5074828",
@@ -127,9 +126,5 @@
   ],
   "MissingKbs": [
     "KB5074109"
-  ],
-  "MissingBreakdown": {
-    "Superseding": 1,
-    "Standalone": 0
-  }
+  ]
 }
