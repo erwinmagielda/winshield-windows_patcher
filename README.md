@@ -1,76 +1,61 @@
 # WinShield
 
-WinShield is a Windows patch posture analysis tool that correlates installed updates with official MSRC CVRF data to identify installed, superseded, and missing KBs on a local system.
+Windows patch posture and update correlation tool for local security analysis.
 
-It is designed as an operator facing utility rather than a background or enterprise scale scanner.
+## What It Is
+WinShield is a local inspection tool that analyses installed Windows updates and correlates them against Microsoft Security Response Center data. It identifies missing, installed, and superseded updates for a specific system in a deterministic and auditable way.
 
-## Overview
-Windows patch state is often fragmented across multiple interfaces and tools.
-WinShield provides a deterministic and auditable view of patch posture by anchoring analysis to the installed LCU and resolving expected updates directly from MSRC data.
+## Why It Exists
+Patch visibility on Windows systems is fragmented across multiple tools. WinShield exists to provide a single, transparent view of patch posture by grounding expectations in authoritative security data rather than opaque update states.
 
-The goal is clarity and trust in what the system should have installed versus what is actually present.
+## Pipeline Overview
+1. System baseline collection  
+2. Installed update inventory enumeration  
+3. Security advisory correlation  
+4. Supersedence resolution logic  
+5. Optional update retrieval and installation  
 
-## Workflow
-WinShield operates in a fixed, staged pipeline:
-
-1. **Baseline collection**  
-   Identifies OS version, build, architecture, LCU anchor, and resolves the MSRC product name.
-
-2. **Inventory collection**  
-   Enumerates installed KBs using Get-HotFix and Get-WindowsPackage.
-
-3. **MSRC correlation**  
-   Pulls CVRF data for the relevant month range and aggregates expected KBs.
-
-4. **Supersedence analysis**  
-   Expands supersedence chains to determine logical presence of older updates.
-
-5. **Remediation support**  
-   Allows optional download and installation of selected missing updates.
+## Project Structure
+```
+winshield/
+├── src/
+│   ├── winshield_master.py
+│   ├── baseline.py
+│   ├── inventory.py
+│   ├── downloader.py
+│   ├── installer.py
+│   └── adapter.py
+│
+├── results/       # Scan output files
+├── downloads/     # Retrieved updates (ignored)
+├── README.md
+└── .gitignore
+```
 
 ## Usage
 Run the interactive entry point:
 
 ```bash
-python winshield_master.py
+python src/winshield_master.py
 ```
 
 The menu allows you to:
-- scan the system
-- download missing updates
-- install downloaded updates
+- Scan system patch state  
+- Download missing updates  
+- Install selected updates  
 
-Administrator privileges are required for full functionality.
+## Data Sources
+WinShield relies on:
+- Microsoft Security Response Center CVRF data  
+- Microsoft Update Catalog metadata  
 
-## Output
-The primary output is a terminal table showing correlated patch state, including:
+All correlation logic is performed locally.
 
-- KB identifier
-- update type
-- installation status (Installed, Superseded, Missing)
-- applicable months
-- associated CVEs
+## Security Notes
+WinShield performs system inspection and update handling locally. No data is transmitted externally beyond official Microsoft endpoints.
 
-A full machine readable result is also written to:
+## Status
+Active development tool.
 
-```
-results/winshield_scan_result.json
-```
-
-This file contains baseline data, inventory, correlation results, and missing KBs.
-
-## Scope and Safety
-- Intended for authorised systems only
-- No exploit code or active vulnerability probing
-- All data sources are official Microsoft endpoints
-- Update installation is explicit and operator controlled
-
-## Implementation
-- Python is used for orchestration and correlation logic
-- PowerShell is used for Windows native data collection
-- MSRC CVRF data and the Microsoft Update Catalog are treated as authoritative sources
-
-## Project Status
-WinShield is maintained as a portfolio and research project.
-
-The implementation prioritises clarity, determinism, and auditability over automation at scale.
+## Licence
+MIT
